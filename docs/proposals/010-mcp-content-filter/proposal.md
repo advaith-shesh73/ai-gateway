@@ -1,5 +1,19 @@
 # Per-Backend MCP Content Filter
 
+> **Post-merge note (2026):** This proposal is preserved as the
+> historical design record. The reference filter implementation and
+> in-process dispatcher (originally `cmd/content-filter/` +
+> `internal/contentfilter/` described below in the *Out-of-Process
+> Policy Service* and *Dispatcher Architecture* sections) have since
+> been **moved out of ai-gateway** and now live in
+> [panacea-agent](https://github.com/nutanix-core/panacea-agent)
+> under `services/aigw-content-filter-dispatcher/` (dispatcher +
+> eval policy) and `services/aigw-content-filter/go/` (evalpolicy
+> HTTP service). The gateway retains only the HTTP client path, the
+> `MCPContentFilter` API surface on `MCPRoute`, the shadow/enforce
+> knobs, and the `GlobalDisable` kill switch. Refer to the
+> panacea-agent repo for the current filter service layout.
+
 ## Introduction
 
 The [MCP Gateway][proposal-006] implementation (proposal 006) lets Envoy AI

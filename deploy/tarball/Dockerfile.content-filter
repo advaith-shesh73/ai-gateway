@@ -1,6 +1,0 @@
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --chown=65532:65532 --chmod=0755 content-filter /app
-USER nonroot:nonroot
-EXPOSE 9093
-ENTRYPOINT ["/app"]
-CMD ["--addr", ":9093", "--config", "/etc/content-filter/config.yaml"]

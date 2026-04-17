@@ -1,44 +1,35 @@
-# MCP Content Filter — Eval Policy example
+# MCP Content Filter — Gateway integration example
 
-These manifests show how to run the out-of-process **content-filter**
-service together with an `MCPRoute` that consults it via the
-`contentFilter` field, deploying panacea-agent
-[PR 95](https://github.com/nutanix-core/panacea-agent/pull/95)
-(evaluation-mode semantic redaction) as a standalone service inside
-the Envoy AI Gateway.
+These manifests show how to wire an `MCPRoute` into an **external**
+content-filter HTTP service via the `contentFilter` field on a
+backend. The gateway itself ships no filter implementation — it
+simply POSTs the request/response body to a filter endpoint and
+applies the verdict (`pass`, `redact`, `reject`).
 
-## What the content-filter service does
+## Where the filter service lives
 
-The content-filter service is a stateless HTTP service that terminates
-the wire contract defined in
-[`internal/contentfilter/wire/envelope.go`](../../internal/contentfilter/wire/envelope.go).
-It accepts `POST /filter` envelopes carrying base64-encoded MCP bodies,
-dispatches them to a pluggable `Policy`, and returns a verdict
-(`pass`, `redact`, `reject`). It also exposes `GET /healthz` for k8s
-probes.
+The reference implementation of the filter service (PR 95 evaluation
+policy — LLM-powered semantic redaction) is maintained in
+[panacea-agent](https://github.com/nutanix-core/panacea-agent)
+under `services/aigw-content-filter-dispatcher/`. Deploy that
+service independently (Helm chart in the same repo) and point these
+gateway manifests at its `Service` address.
 
-The first policy we ship is **`eval`** — the Go port of PR 95's
-LLM-powered redactor. For each response-scope `tools/call` invocation,
-it:
+From the gateway's point of view the filter is just another HTTP
+backend speaking a tiny JSON envelope:
 
-1. Base64-decodes the JSON-RPC envelope forwarded by the gateway.
-2. Extracts the tool output, unwrapping the MCP `content` wrapper if
-   present (preserves extra fields byte-for-byte).
-3. Issues a single-turn chat completion against an OpenAI-compatible
-   endpoint (default: `https://hkn12.ai.nutanix.com/enterpriseai/v1/chat/completions`,
-   default model: `hack-reason`) with the PR 95 prompts.
-4. Strips `<think>` blocks and markdown fences from the LLM response,
-   rebuilds the MCP wrapper, and returns the redacted body to the
-   gateway.
-5. If the LLM is unreachable or returns non-JSON, falls back to a
-   hard-coded safe redaction (`[ENTIRE OUTPUT REDACTED - FILTER
-UNAVAILABLE]`) — over-filtering is always preferred to data leakage.
+- `POST /v1/filter`
+- Request body: `{"scope":"request|response","tool":"...","bodyBase64":"..."}`
+- Response body: `{"action":"pass|redact|reject","bodyBase64":"...","reason":"..."}`
+
+Any service implementing that contract is acceptable — the evaluation
+policy in panacea-agent is one reference implementation, not the only
+one.
 
 ## Files in this directory
 
 | File                             | Purpose                                                                                                 |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `content-filter-deployment.yaml` | Deploys the content-filter service (Deployment, Service, ConfigMap, Secret, ServiceAccount, Namespace). |
 | `gateway-route-shadow.yaml`      | Example `MCPRoute` wiring the filter into a Jira backend in **shadow mode** with 10% sampling.          |
 | `gateway-route-enforce.yaml`     | Same `MCPRoute` flipped to **enforce mode** with `failurePolicy: Fail`.                                 |
 | `global-kill-switch.yaml`        | Example `MCPContentFilterPolicy` ConfigMap for the cluster-wide `globalDisable` knob.                   |
@@ -49,23 +40,38 @@ The three knobs that matter during rollout are:
 
 1. **`mode`** (on the `MCPContentFilter` spec) — `Shadow` observes,
    `Enforce` applies the verdict.
-2. **`shadowSampleRatePermille`** (in permille, 0..1000) — caps LLM
-   cost during shadow rollout. Ignored in enforce mode.
+2. **`shadowSampleRatePermille`** (in permille, 0..1000) — caps
+   filter-service cost during shadow rollout. Ignored in enforce
+   mode.
 3. **`enabled`** (per-backend) and **`globalDisable`** (cluster-wide)
    — two kill switches, no gateway restart needed.
 
-### Step 1 — Deploy the service
+### Step 1 — Deploy the filter service
 
-```bash
-# Adjust the registry + tag to yours, then:
-kubectl apply -f content-filter-deployment.yaml
-kubectl -n content-filter rollout status deploy/content-filter --timeout=90s
-```
+See the [panacea-agent
+documentation](https://github.com/nutanix-core/panacea-agent/tree/main/services/aigw-content-filter-dispatcher)
+for how to deploy the external filter service. Make a note of the
+Kubernetes `Service` DNS name (e.g.
+`aigw-content-filter.panacea.svc.cluster.local:8080`) — you'll
+reference it in the `MCPRoute` backend config below.
 
-Set the LLM bearer token in the `content-filter-llm-credentials`
-Secret before traffic starts flowing. Without a token the policy
-returns safe-redaction for every filtered call (useful for smoke
-tests; useless in production).
+A few deployment checks worth confirming on the filter Pod:
+
+- **Set an explicit `terminationGracePeriodSeconds`** on the filter
+  Pod equal to *at least* the longest `timeoutSeconds` you configure
+  on any `MCPContentFilter` pointing at it, plus a small buffer
+  (e.g. +5s) to cover connection draining. Without this, rolling
+  the filter during peak traffic can cause in-flight filter calls
+  to be cut short and trip gateway-side `failurePolicy`.
+- Expose `/healthz` and `/readyz` on the filter container and wire
+  them into Pod readiness/liveness probes. The gateway only uses
+  them transitively (via Service endpoint selection), but they are
+  what lets Kubernetes roll the Deployment without sending traffic
+  to a half-initialised pod.
+- Run with a realistic `replicaCount` and `PodDisruptionBudget` so
+  that a node drain cannot take down the last replica — otherwise a
+  routine maintenance window flips the gateway into `failed-open`
+  (or worse, `unavailable` + `Fail`) for every filtered backend.
 
 ### Step 2 — Shadow rollout (measure)
 
@@ -84,14 +90,14 @@ Key metrics (exposed on the gateway's Prometheus endpoint):
 
 - `mcp_filter_decisions_total{action="shadow_would_pass"}` — tool
   output was clean.
-- `mcp_filter_decisions_total{action="shadow_would_redact"}` — LLM
-  rewrote the body.
-- `mcp_filter_decisions_total{action="shadow_would_reject"}` — policy
-  chose to reject.
-- `mcp_filter_decisions_total{action="shadow_sampled_out"}` — call was
-  NOT sent to the filter (below the sample-rate budget).
-- `mcp_filter_decisions_total{action="shadow_would_fail"}` — upstream
-  filter errored; would have fallen back per FailurePolicy.
+- `mcp_filter_decisions_total{action="shadow_would_redact"}` —
+  filter rewrote the body.
+- `mcp_filter_decisions_total{action="shadow_would_reject"}` —
+  filter chose to reject.
+- `mcp_filter_decisions_total{action="shadow_sampled_out"}` — call
+  was NOT sent to the filter (below the sample-rate budget).
+- `mcp_filter_decisions_total{action="shadow_would_fail"}` —
+  upstream filter errored; would have fallen back per FailurePolicy.
 
 Hold in shadow mode until the rate of `would_redact` and
 `would_reject` decisions stabilises and matches the expected
@@ -113,35 +119,19 @@ If anything regresses, the fastest rollback path is the cluster-wide
 kill switch:
 
 ```bash
-kubectl -n envoy-gateway-system patch configmap mcp-content-filter-policy \
-  --type merge \
-  -p '{"data":{"policy.json":"{\"globalDisable\": true, ...}"}}'
+kubectl apply -f global-kill-switch.yaml
 ```
 
 (For a targeted rollback, flip the per-backend `enabled: false`
 instead — that's a single `kubectl edit mcproute` and only affects
 one backend.)
 
-## Customising the filter policy
+## Tuning the filter's behaviour
 
-The content-filter ConfigMap in `content-filter-deployment.yaml`
-carries the PR 95 defaults verbatim. The common knobs:
-
-| Field                        | Purpose                                                         | Default                                                                         |
-| ---------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `eval.endpoint`              | OpenAI-compatible chat/completions URL.                         | `https://hkn12.ai.nutanix.com/enterpriseai/v1/chat/completions` (PR 95 default) |
-| `eval.model`                 | Model name in the request payload.                              | `"hack-reason"`                                                                 |
-| `eval.apiKeyEnv`             | Env var to read the bearer token from.                          | `"LLM_API_KEY"`                                                                 |
-| `eval.apiKeyFile`            | Alternative file-mount path for the bearer token.               | `""`                                                                            |
-| `eval.timeoutSeconds`        | Per-call LLM timeout (seconds).                                 | `60`                                                                            |
-| `eval.temperature`           | Sampling temperature (keep at 0 for determinism).               | `0`                                                                             |
-| `eval.insecureSkipTLSVerify` | Skip TLS verify (matches PR 95 for internal endpoints).         | `false`                                                                         |
-| `eval.filteredTools`         | Allowlist of tool names to actually LLM-filter.                 | `[]` (=passthrough)                                                             |
-| `eval.evalTicketID`          | Default evaluation ticket ID (replaceable per-call via header). | `""`                                                                            |
-| `eval.ticketHeader`          | Header name for per-call ticket override.                       | `"X-Eval-Ticket-Id"`                                                            |
-
-Per-call ticket ID: the gateway forwards the header listed in the
-`MCPContentFilter.forwardHeaders` list to the filter. If it matches
-`eval.ticketHeader`, that value wins over `eval.evalTicketID` —
-this lets one filter pod serve many concurrent evaluation runs
-without a restart.
+All filter-side knobs (LLM endpoint, model, filtered tool allowlist,
+timeout, ticket-header name, etc.) now live with the external
+service — see `services/aigw-content-filter-dispatcher/` in
+panacea-agent. The gateway only controls **when** the filter is
+invoked (shadow vs enforce, sample rate, kill switches) and **how**
+it reacts to verdicts — it does not understand the filter's
+internals.

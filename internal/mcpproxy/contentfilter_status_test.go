@@ -8,10 +8,12 @@ package mcpproxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,21 +21,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/json"
 )
 
 // Tests for L04: X-Content-Filter-Status header on every proxied response.
 //
-// The header is the single observable handle dashboards and
-// integration tests use to correlate filter outcomes with specific
-// requests without parsing the response body. It must be accurate
-// on EVERY exit path of applyContentFilterOn{Request,Response}
-// regardless of failure policy, and the matching
-// mcp_filter_status_total counter must be emitted exactly once per
-// non-off status.
+// The header is the single observable handle dashboards and integration
+// tests use to correlate filter outcomes with specific requests without
+// parsing the response body. It must be accurate on EVERY exit path of
+// applyContentFilterOn{Request,Response} regardless of failure policy,
+// and the matching mcp_filter_status_total counter must be emitted
+// exactly once per non-off status.
 //
-// This file exercises the contract on both the low-level WithStatus
-// helpers (ensuring every code path populates a non-empty status) and
-// the package-level writeFilterStatus helper that handlers call.
+// After the gateway slimming refactor, the filter is exclusively
+// invoked over HTTP against an external service. These tests stand up
+// a httptest.NewServer that returns canned filter verdicts to exercise
+// every status branch without an in-process dispatcher.
 
 // statusMetricValue returns the current value of
 // mcp_filter_status_total{route,backend,status}. Helper for terse
@@ -52,6 +55,50 @@ func newStatusTestMetrics(t *testing.T) *PrometheusMetrics {
 	return NewPrometheusMetrics(prometheus.NewRegistry())
 }
 
+// passFilterServer returns an httptest server that always responds
+// with a pass verdict.
+func passFilterServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+}
+
+// redactFilterServer returns an httptest server that responds with a
+// redact verdict whose replacement body is the supplied bytes.
+func redactFilterServer(t *testing.T, replacement []byte, reason string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:     contentFilterActionRedact,
+			BodyBase64: base64.StdEncoding.EncodeToString(replacement),
+			Reason:     reason,
+		})
+	}))
+}
+
+// rejectFilterServer returns an httptest server that always responds
+// with a reject verdict.
+func rejectFilterServer(t *testing.T, reason string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action: contentFilterActionReject,
+			Reason: reason,
+		})
+	}))
+}
+
+// brokenFilterServer returns an httptest server that always responds
+// with malformed JSON, forcing the gateway's fail-open / fail-closed
+// branch.
+func brokenFilterServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("not-json"))
+	}))
+}
+
 // --- applyContentFilterOnRequestWithStatus: status coverage -------------
 
 func TestApplyContentFilterOnRequestWithStatus_NilFilterIsOff(t *testing.T) {
@@ -65,8 +112,6 @@ func TestApplyContentFilterOnRequestWithStatus_NilFilterIsOff(t *testing.T) {
 }
 
 func TestApplyContentFilterOnRequestWithStatus_ScopeDisabledIsOff(t *testing.T) {
-	// A filter that is wired only for Response scope must report
-	// FilterStatusOff on the Request path (no silent pass).
 	cf := &contentFilter{invokeOnRequest: false, invokeOnResponse: true}
 	req := &jsonrpc.Request{ID: makeID(t, float64(1)), Method: "tools/call"}
 	got, status, err := applyContentFilterOnRequestWithStatus(
@@ -78,14 +123,13 @@ func TestApplyContentFilterOnRequestWithStatus_ScopeDisabledIsOff(t *testing.T) 
 }
 
 func TestApplyContentFilterOnRequestWithStatus_PassReportsPass(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return PassResponse("clean")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := passFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	req := &jsonrpc.Request{
-		ID: makeID(t, float64(1)), Method: "tools/call",
+		ID:     makeID(t, float64(1)),
+		Method: "tools/call",
 		Params: mustJSON(t, map[string]any{"name": "lookup"}),
 	}
 
@@ -98,9 +142,6 @@ func TestApplyContentFilterOnRequestWithStatus_PassReportsPass(t *testing.T) {
 }
 
 func TestApplyContentFilterOnRequestWithStatus_RedactReportsRedact(t *testing.T) {
-	// Pre-encode a replacement body. The wrapper restores the original
-	// request's ID post-decode, so the stand-in ID we embed here is
-	// irrelevant — only the shape of the body matters.
 	redacted := &jsonrpc.Request{
 		ID:     makeID(t, float64(999)),
 		Method: "tools/call",
@@ -109,11 +150,9 @@ func TestApplyContentFilterOnRequestWithStatus_RedactReportsRedact(t *testing.T)
 	redactedBody, encErr := jsonrpc.EncodeMessage(redacted)
 	require.NoError(t, encErr)
 
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return RedactResponse(redactedBody, "pii removed")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := redactFilterServer(t, redactedBody, "pii removed")
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	req := &jsonrpc.Request{
 		ID:     makeID(t, float64(42)),
@@ -128,19 +167,17 @@ func TestApplyContentFilterOnRequestWithStatus_RedactReportsRedact(t *testing.T)
 	require.NotNil(t, got)
 	require.NotSame(t, req, got, "redact returns a new request pointer (body changed)")
 	require.Equal(t, FilterStatusRedact, status)
-	// ID must be preserved through redact (existing contract).
-	require.Equal(t, req.ID, got.ID)
+	require.Equal(t, req.ID, got.ID, "redact must preserve the original JSON-RPC ID")
 }
 
 func TestApplyContentFilterOnRequestWithStatus_RejectReportsReject(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return RejectResponse("blocked by policy", 0, "")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := rejectFilterServer(t, "blocked by policy")
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	req := &jsonrpc.Request{
-		ID: makeID(t, float64(1)), Method: "tools/call",
+		ID:     makeID(t, float64(1)),
+		Method: "tools/call",
 		Params: mustJSON(t, map[string]any{"name": "lookup"}),
 	}
 
@@ -153,16 +190,13 @@ func TestApplyContentFilterOnRequestWithStatus_RejectReportsReject(t *testing.T)
 }
 
 func TestApplyContentFilterOnRequestWithStatus_FailClosedReportsUnavailable(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		// Return a FilterResponse with an invalid action; the dispatcher
-		// adapter translates this into an error.
-		return FilterResponse{Action: "bogus"}
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, true) // fail-closed
+	srv := brokenFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, true) // fail-closed
 
 	req := &jsonrpc.Request{
-		ID: makeID(t, float64(1)), Method: "tools/call",
+		ID:     makeID(t, float64(1)),
+		Method: "tools/call",
 		Params: mustJSON(t, map[string]any{"name": "lookup"}),
 	}
 
@@ -175,14 +209,13 @@ func TestApplyContentFilterOnRequestWithStatus_FailClosedReportsUnavailable(t *t
 }
 
 func TestApplyContentFilterOnRequestWithStatus_FailOpenReportsFailedOpen(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return FilterResponse{Action: "bogus"}
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false) // fail-open
+	srv := brokenFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false) // fail-open
 
 	req := &jsonrpc.Request{
-		ID: makeID(t, float64(1)), Method: "tools/call",
+		ID:     makeID(t, float64(1)),
+		Method: "tools/call",
 		Params: mustJSON(t, map[string]any{"name": "lookup"}),
 	}
 
@@ -207,11 +240,9 @@ func TestApplyContentFilterOnResponseWithStatus_NilFilterIsOff(t *testing.T) {
 }
 
 func TestApplyContentFilterOnResponseWithStatus_PassReportsPass(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return PassResponse("clean")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := passFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	resp := &jsonrpc.Response{ID: makeID(t, float64(1)), Result: mustJSON(t, map[string]any{"ok": true})}
 	got, status, err := applyContentFilterOnResponseWithStatus(
@@ -223,11 +254,9 @@ func TestApplyContentFilterOnResponseWithStatus_PassReportsPass(t *testing.T) {
 }
 
 func TestApplyContentFilterOnResponseWithStatus_RejectReportsReject(t *testing.T) {
-	h := &fakeHandler{name: "b", fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return RejectResponse("blocked by policy", 0, "")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := rejectFilterServer(t, "blocked by policy")
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	resp := &jsonrpc.Response{ID: makeID(t, float64(1)), Result: mustJSON(t, map[string]any{"ok": true})}
 	got, status, err := applyContentFilterOnResponseWithStatus(
@@ -247,9 +276,6 @@ func TestWriteFilterStatus_SetsHeader(t *testing.T) {
 }
 
 func TestWriteFilterStatus_OverwritesPreviousValue(t *testing.T) {
-	// Simulates the Response-scope path overwriting the Request-scope
-	// value on the same request — valid by contract because Response
-	// scope is authoritative when both fire.
 	rec := httptest.NewRecorder()
 	writeFilterStatus(rec, "r1", "b1", FilterStatusPass)
 	writeFilterStatus(rec, "r1", "b1", FilterStatusRedact)
@@ -257,9 +283,6 @@ func TestWriteFilterStatus_OverwritesPreviousValue(t *testing.T) {
 }
 
 func TestWriteFilterStatus_NilWriterIsNoop(t *testing.T) {
-	// Tolerating a nil writer keeps the test surface permissive and
-	// means we can reuse writeFilterStatus from paths that only care
-	// about the metric side-effect.
 	require.NotPanics(t, func() {
 		writeFilterStatus(nil, "r1", "b1", FilterStatusPass)
 	})
@@ -278,8 +301,6 @@ func TestWriteFilterStatus_EmitsMetricWhenInstalled(t *testing.T) {
 }
 
 func TestWriteFilterStatus_NilMetricsIsSilent(t *testing.T) {
-	// Default state: no metrics installed. Header still gets written,
-	// no metric side-effect, no panic.
 	SetFilterMetrics(nil)
 	rec := httptest.NewRecorder()
 	require.NotPanics(t, func() {
@@ -298,10 +319,6 @@ func TestEmitStashedFilterStatus_NilContextIsNoop(t *testing.T) {
 }
 
 func TestEmitStashedFilterStatus_UnsetStatusIsNoop(t *testing.T) {
-	// Default zero value of FilterStatus is "" (empty string), which
-	// signals "no filter fired". The helper must not advertise a
-	// header in that case — preserving pre-L04 behavior for backends
-	// with no filter configured at all.
 	m := &mcpRequestContext{}
 	rec := httptest.NewRecorder()
 	m.emitStashedFilterStatus(rec)
@@ -328,9 +345,6 @@ func TestEmitStashedFilterStatus_WritesHeaderAndMetric(t *testing.T) {
 // --- SetFilterMetrics atomic swap --------------------------------------
 
 func TestSetFilterMetrics_AtomicSwap(t *testing.T) {
-	// Swapping metrics under the feet of a handler must not race or
-	// panic; the hook is read via atomic.Pointer and every access
-	// re-loads.
 	a := newStatusTestMetrics(t)
 	b := newStatusTestMetrics(t)
 	t.Cleanup(func() { SetFilterMetrics(nil) })
@@ -346,7 +360,7 @@ func TestSetFilterMetrics_AtomicSwap(t *testing.T) {
 	require.Equal(t, 1.0, statusMetricValue(t, b, "r", "b", "pass"), "new metric counter must record the post-swap call")
 
 	SetFilterMetrics(nil)
-	writeFilterStatus(nil, "r", "b", FilterStatusPass) // no-op on metrics
+	writeFilterStatus(nil, "r", "b", FilterStatusPass)
 	require.Equal(t, 1.0, statusMetricValue(t, b, "r", "b", "pass"))
 }
 
@@ -376,11 +390,9 @@ func TestProxyResponseBody_EmitsFilterStatusHeader(t *testing.T) {
 		backendName = filterapi.MCPBackendName("backend-a")
 	)
 
-	h := &fakeHandler{name: backendName, fn: func(_ context.Context, _ *FilterRequest, _ any) FilterResponse {
-		return PassResponse("clean")
-	}}
-	d := newDispatcherForHandler(t, h)
-	cf := newDispatcherFilter(t, d, false)
+	srv := passFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
 
 	proxy.mcpProxyConfig = &mcpProxyConfig{
 		backendListenerAddr: "http://test-backend",
@@ -405,8 +417,10 @@ func TestProxyResponseBody_EmitsFilterStatusHeader(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	s := &session{route: routeName}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	err = proxy.proxyResponseBody(
-		t.Context(), s, rr, httpResp,
+		ctx, s, rr, httpResp,
 		&jsonrpc.Request{Method: "tools/call", ID: id},
 		filterapi.MCPBackend{Name: backendName},
 	)

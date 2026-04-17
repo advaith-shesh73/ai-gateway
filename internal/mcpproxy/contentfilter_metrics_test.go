@@ -7,62 +7,35 @@ package mcpproxy
 
 import (
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
-// TestPrometheusMetrics_RegistersAllFourteenVectors exercises the
-// headline guarantee of L03: every one of the 14 metric names is
-// present in the registry after construction.
+// TestPrometheusMetrics_RegistersThreeFilterVectors exercises the
+// headline guarantee of the gateway metrics surface: the three filter
+// vectors (decisions, status, inflight) are all present in the
+// registry after construction.
 //
 // Prometheus only emits a metric family in Gather() after it has been
 // written to at least once, so the test seeds one observation per
-// vector before scanning. That matches production reality — these
-// vectors will be written before any scrape lands.
-func TestPrometheusMetrics_RegistersAllFourteenVectors(t *testing.T) {
+// vector before scanning.
+func TestPrometheusMetrics_RegistersThreeFilterVectors(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewPrometheusMetrics(reg)
 
-	// Seed one observation per vector so Gather() surfaces it.
-	pii := m.AsPII()
-	pii.RecordCall("ok", "ctx")
-	pii.ObserveCallDuration(0, "ctx")
-	pii.ObserveChunkFanout(1, "ctx")
-	pii.AddBytes(1, "ctx")
-	pii.RecordCacheLookup("pii", "hit")
-	jira := m.AsJira()
-	jira.RecordCall("ok", "op")
-	jira.ObserveCallDuration(0, "op")
-	br := m.AsBreaker()
-	br.OnState("pii", CircuitClosed)
-	br.OnTransition("pii", CircuitClosed, CircuitOpen)
 	m.RecordDecision("r", "b", ScopeRequest, ActionPass)
 	m.RecordStatus("r", "b", "ok")
 	m.IncInflight("r", "b")
-	m.SetQueueDepth("s", 0)
-	m.RecordPanic("w")
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
 
 	want := []string{
-		"pii_calls_total",
-		"pii_call_duration_seconds",
-		"pii_chunks_total",
-		"pii_bytes_total",
-		"cache_lookups_total",
-		"jira_calls_total",
-		"jira_call_duration_seconds",
-		"mcp_filter_circuit_state",
-		"mcp_filter_circuit_transitions_total",
 		"mcp_filter_decisions_total",
 		"mcp_filter_status_total",
 		"mcp_filter_inflight",
-		"mcp_filter_queue_depth",
-		"mcp_filter_worker_panics_total",
 	}
 	got := map[string]bool{}
 	for _, f := range families {
@@ -89,83 +62,9 @@ func TestPrometheusMetrics_DoubleRegisterPanics(t *testing.T) {
 	_ = NewPrometheusMetrics(reg)
 }
 
-// TestPrometheusMetrics_AsPII_EmitsOnAllFiveMetrics ensures the PII
-// adapter hits every PIIMetrics-mapped vector once, with the right
-// labels.
-func TestPrometheusMetrics_AsPII_EmitsOnAllFiveMetrics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewPrometheusMetrics(reg)
-	pii := m.AsPII()
-
-	pii.RecordCall("ok", "ctx-a")
-	pii.RecordCall("timeout", "ctx-b")
-	pii.ObserveCallDuration(150*time.Millisecond, "ctx-a")
-	pii.ObserveChunkFanout(3, "ctx-a")
-	pii.AddBytes(1234, "ctx-a")
-	pii.RecordCacheLookup("pii", "hit")
-	pii.RecordCacheLookup("pii", "miss")
-
-	require.Equal(t, 1.0, testutil.ToFloat64(m.piiCalls.WithLabelValues("ok", "ctx-a")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.piiCalls.WithLabelValues("timeout", "ctx-b")))
-	require.Equal(t, 1234.0, testutil.ToFloat64(m.piiBytes.WithLabelValues("ctx-a")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.cacheLookups.WithLabelValues("pii", "hit")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.cacheLookups.WithLabelValues("pii", "miss")))
-
-	// Histograms: assert at least one observation was recorded.
-	dur, err := reg.Gather()
-	require.NoError(t, err)
-	var sawDur, sawChunks bool
-	for _, f := range dur {
-		if f.GetName() == "pii_call_duration_seconds" && len(f.GetMetric()) > 0 {
-			sawDur = true
-		}
-		if f.GetName() == "pii_chunks_total" && len(f.GetMetric()) > 0 {
-			sawChunks = true
-		}
-	}
-	require.True(t, sawDur, "pii_call_duration_seconds must see at least one observation")
-	require.True(t, sawChunks, "pii_chunks_total must see at least one observation")
-}
-
-// TestPrometheusMetrics_AsJira_EmitsOnBothMetrics mirrors the PII
-// check for the Jira adapter.
-func TestPrometheusMetrics_AsJira_EmitsOnBothMetrics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewPrometheusMetrics(reg)
-	jira := m.AsJira()
-
-	jira.RecordCall("ok", "fetch_issue")
-	jira.RecordCall("http_error", "fetch_issue")
-	jira.ObserveCallDuration(50*time.Millisecond, "fetch_issue")
-
-	require.Equal(t, 1.0, testutil.ToFloat64(m.jiraCalls.WithLabelValues("ok", "fetch_issue")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.jiraCalls.WithLabelValues("http_error", "fetch_issue")))
-}
-
-// TestPrometheusMetrics_AsBreaker_PublishesStateAndTransitions verifies
-// the breaker adapter updates the state gauge (latest-wins) and the
-// transitions counter (monotonic).
-func TestPrometheusMetrics_AsBreaker_PublishesStateAndTransitions(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewPrometheusMetrics(reg)
-	br := m.AsBreaker()
-
-	br.OnState("pii", CircuitClosed)
-	br.OnTransition("pii", CircuitClosed, CircuitOpen)
-	br.OnState("pii", CircuitOpen)
-	br.OnTransition("pii", CircuitOpen, CircuitHalfOpen)
-	br.OnState("pii", CircuitHalfOpen)
-	br.OnTransition("pii", CircuitHalfOpen, CircuitClosed)
-	br.OnState("pii", CircuitClosed)
-
-	require.Equal(t, float64(CircuitClosed), testutil.ToFloat64(m.circuitState.WithLabelValues("pii")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.circuitTransitions.WithLabelValues("pii", "closed", "open")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.circuitTransitions.WithLabelValues("pii", "open", "half_open")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.circuitTransitions.WithLabelValues("pii", "half_open", "closed")))
-}
-
 // TestPrometheusMetrics_RecordDecisionAndStatus exercises the
-// dispatcher-oriented convenience methods.
+// decisions + status counters the gateway emits after every filter
+// round-trip.
 func TestPrometheusMetrics_RecordDecisionAndStatus(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewPrometheusMetrics(reg)
@@ -183,9 +82,9 @@ func TestPrometheusMetrics_RecordDecisionAndStatus(t *testing.T) {
 	require.Equal(t, 1.0, testutil.ToFloat64(m.filterStatus.WithLabelValues("route-a", "supportgpt", "passthrough")))
 }
 
-// TestPrometheusMetrics_InflightAndQueueDepthGauges confirms the
-// saturation gauges round-trip values correctly.
-func TestPrometheusMetrics_InflightAndQueueDepthGauges(t *testing.T) {
+// TestPrometheusMetrics_InflightGauge confirms the saturation gauge
+// round-trips Inc/Dec correctly.
+func TestPrometheusMetrics_InflightGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewPrometheusMetrics(reg)
 
@@ -194,77 +93,43 @@ func TestPrometheusMetrics_InflightAndQueueDepthGauges(t *testing.T) {
 	m.IncInflight("route-a", "supportgpt")
 	m.DecInflight("route-a", "supportgpt")
 	require.Equal(t, 2.0, testutil.ToFloat64(m.filterInflight.WithLabelValues("route-a", "supportgpt")))
-
-	m.SetQueueDepth("pii-admission", 42)
-	require.Equal(t, 42.0, testutil.ToFloat64(m.filterQueueDepth.WithLabelValues("pii-admission")))
-
-	m.SetQueueDepth("pii-admission", 0)
-	require.Equal(t, 0.0, testutil.ToFloat64(m.filterQueueDepth.WithLabelValues("pii-admission")))
-}
-
-// TestPrometheusMetrics_RecordPanic exercises the L07 follow-up:
-// every panic surfaced by safeGo increments the worker-panic counter.
-func TestPrometheusMetrics_RecordPanic(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewPrometheusMetrics(reg)
-
-	m.RecordPanic("pii chunk worker")
-	m.RecordPanic("pii chunk worker")
-	m.RecordPanic("scan part worker")
-	require.Equal(t, 2.0, testutil.ToFloat64(m.workerPanics.WithLabelValues("pii chunk worker")))
-	require.Equal(t, 1.0, testutil.ToFloat64(m.workerPanics.WithLabelValues("scan part worker")))
-}
-
-// TestSetPanicRecorder_WiresSafeGoToMetrics verifies the
-// [SetPanicRecorder] hook is actually invoked from [safeGo] when a
-// worker panics. This is the glue that connects L07 (panic recovery)
-// to L03 (metrics registry).
-func TestSetPanicRecorder_WiresSafeGoToMetrics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewPrometheusMetrics(reg)
-
-	// Install, tear down via t.Cleanup so we don't leak into later
-	// tests.
-	SetPanicRecorder(m.RecordPanic)
-	t.Cleanup(func() { SetPanicRecorder(nil) })
-
-	err := safeGo("boom worker", func() error {
-		panic("intentional panic for test")
-	})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "boom worker panic")
-	require.InDelta(t, 1.0, testutil.ToFloat64(m.workerPanics.WithLabelValues("boom worker")), 0.0001)
-}
-
-// TestSetPanicRecorder_NilIsSafe guards against regressions where a
-// nil callback would panic inside the recover path (which would then
-// poison the goroutine that was meant to survive).
-func TestSetPanicRecorder_NilIsSafe(t *testing.T) {
-	SetPanicRecorder(nil)
-	err := safeGo("still boom", func() error { panic("x") })
-	require.Error(t, err)
 }
 
 // TestPrometheusMetrics_NilReceiverIsInert ensures the metric-emitting
-// convenience methods are no-ops on a nil receiver. This matches the
-// Dispatcher's code path where metrics may not be wired in tests.
+// convenience methods are no-ops on a nil receiver. This matches
+// gateway hot paths where metrics may not be wired in tests.
 func TestPrometheusMetrics_NilReceiverIsInert(_ *testing.T) {
-	var m *PrometheusMetrics // nil
-	// None of these must panic or allocate observable state.
+	var m *PrometheusMetrics
 	m.RecordDecision("r", "b", ScopeRequest, ActionPass)
 	m.RecordStatus("r", "b", "ok")
 	m.IncInflight("r", "b")
 	m.DecInflight("r", "b")
-	m.SetQueueDepth("s", 1)
-	m.RecordPanic("w")
 }
 
 // TestPrometheusMetrics_EmptyLabelFlattensToDash verifies the
 // labelOrDash substitution survives the round trip. An empty route
-// would otherwise break Prometheus-side label grouping.
+// would otherwise collapse into a single mystery series on Prometheus.
 func TestPrometheusMetrics_EmptyLabelFlattensToDash(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewPrometheusMetrics(reg)
 	m.RecordDecision("", "", ScopeRequest, ActionPass)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.filterDecisions.WithLabelValues("-", "-", "Request", "pass")))
+}
+
+// TestPrometheusMetrics_CardinalityGuardRewritesOverflowTuples exercises
+// the defense-in-depth cap: once the decisions guard is at capacity,
+// new label tuples are rewritten to the overflow sentinel instead of
+// exploding the series count.
+func TestPrometheusMetrics_CardinalityGuardRewritesOverflowTuples(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewPrometheusMetrics(reg).WithCardinalityLimit(1)
+
+	m.RecordDecision("r1", "b1", ScopeRequest, ActionPass)
+	m.RecordDecision("r2", "b2", ScopeResponse, ActionRedact)
+
+	require.Equal(t, 1.0, testutil.ToFloat64(m.filterDecisions.WithLabelValues("r1", "b1", "Request", "pass")))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.filterDecisions.WithLabelValues(
+		CardinalityOverflowLabel, CardinalityOverflowLabel, CardinalityOverflowLabel, CardinalityOverflowLabel,
+	)))
+	require.EqualValues(t, 1, m.DecisionGuard().OverflowCount())
 }

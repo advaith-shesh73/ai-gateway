@@ -417,8 +417,8 @@ spec:
 | `url`                      | HTTP endpoint of the filter service. Must use `http://` or `https://`.                                                                                                                                                            |
 | `scopes`                   | One or both of `Request` and `Response`. The filter is only invoked at the scopes listed here.                                                                                                                                    |
 | `timeoutSeconds`           | Per-invocation timeout (default `10`, max `120`).                                                                                                                                                                                 |
-| `failurePolicy`            | `PassThrough` (default) forwards the unmodified payload when the filter is unreachable or errors. `Fail` aborts the tool call with a JSON-RPC error. Reject responses from the filter always abort the call regardless of policy. |
-| `forwardHeaders`           | Optional list of client-request header names that are copied into the filter request (case-insensitive, at most 16 entries).                                                                                                      |
+| `failurePolicy`            | `PassThrough` (default, fail-open) forwards the unmodified payload when the filter is unreachable, returns non-2xx, returns malformed JSON, or exceeds `timeoutSeconds`. `Fail` (fail-closed) aborts the call with JSON-RPC error `-32011`. `reject` from the filter always aborts the call with `-32010`, regardless of policy. Every failure increments `mcp_filter_status_total{status="failed-open"\|"unavailable"}`; page on sustained rates even when configured fail-open. |
+| `forwardHeaders`           | Optional list of client-request header names (case-insensitive, at most 16 entries) copied into the filter request. **SECURITY:** each entry is sent verbatim to the filter host and its observers — NEVER list `Authorization`, `Cookie`, `Proxy-Authorization`, or any header carrying a bearer token or session identifier unless the filter is explicitly in-scope for handling those secrets. Prefer opaque IDs (request ID, tenant ID, evaluation ticket ID). |
 | `mode`                     | `Enforce` (default) applies the filter verdict. `Shadow` invokes the filter but always forwards the ORIGINAL body; verdicts are recorded via `X-Content-Filter-Status`, `mcp_filter_decisions_total`, and redaction audit events. |
 | `enabled`                  | Per-backend kill switch (default `true`). Setting `false` skips the filter entirely and emits `X-Content-Filter-Status: disabled`. Configuration is preserved for easy re-enable.                                                 |
 | `shadowSampleRatePermille` | Sampling budget in permille (0..1000, default `1000`). Applies only when `mode: Shadow`. Values below 1000 cap LLM cost; invocations that are not sampled record `action=shadow_sampled_out` and skip the filter call.            |
@@ -455,8 +455,9 @@ external rollout tooling:
    `true` disables every filter on every backend in the cluster —
    the intended knob for incident response.
 
-All four knobs hot-reload via the `AtomicDispatcher` pointer swap;
-changing any of them does NOT require a gateway pod restart.
+All four knobs hot-reload through the controller's CRD watch and the
+gateway's atomic config pointer swap; changing any of them does NOT
+require a gateway pod restart.
 
 ```yaml
 # Shadow rollout at 10% sampling
@@ -481,10 +482,10 @@ changing any of them does NOT require a gateway pod restart.
 ```
 
 See [`examples/content-filter/`](https://github.com/envoyproxy/ai-gateway/tree/main/examples/content-filter)
-for a complete deployment of the reference `content-filter` service
-(including the LLM-powered evaluation-mode redactor ported from
-panacea-agent PR 95) together with example routes in both shadow and
-enforce modes.
+for example `MCPRoute` manifests in both shadow and enforce modes and
+the `MCPContentFilterPolicy` cluster-wide kill-switch ConfigMap. The
+reference filter service itself (LLM-powered evaluation-mode redactor)
+lives with `panacea-agent` under `services/aigw-content-filter-dispatcher/`.
 
 #### Wire Protocol
 
@@ -521,9 +522,18 @@ Response (filter &rarr; gateway):
 `bodyBase64` replacement; `reject` optionally carries a `reason` string that
 is surfaced to the caller via the JSON-RPC error envelope.
 
-When the filter is unavailable the gateway applies `failurePolicy`; when the
-filter returns `reject` the gateway always emits a JSON-RPC error
-(`-32010 content filter rejected request|response`) regardless of policy.
+The gateway emits two dedicated JSON-RPC error codes back to the MCP client
+on filter-related aborts:
+
+| Code     | When it is emitted                                                                                                                                                                                                                                                                 |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-32010` | The filter returned `action: reject` (either request- or response-scope). The filter's `reason` is surfaced in the error message. The gateway always honours a reject regardless of `failurePolicy`.                                                                               |
+| `-32011` | The filter could not be consulted (connection refused, non-2xx, malformed body, timeout) AND `failurePolicy: Fail` was configured. The gateway refuses to serve unscanned content and aborts the call. With the default `failurePolicy: PassThrough` the gateway silently forwards the original payload instead. |
+
+Both codes fall inside the MCP implementation-defined range and are
+stable across gateway releases. Clients can rely on them to distinguish
+"the filter decided no" (-32010, user-visible policy violation) from
+"the filter was broken" (-32011, operator-visible infrastructure issue).
 
 ## See Also
 

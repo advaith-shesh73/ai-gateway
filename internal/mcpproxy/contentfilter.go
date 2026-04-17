@@ -131,18 +131,14 @@ const (
 // [filterapi.MCPContentFilter]. It is shared between goroutines without
 // mutation for the lifetime of the configuration snapshot.
 //
-// A contentFilter carries two mutually-exclusive invocation modes:
-//
-//  1. HTTP sidecar (legacy, Python era): when `dispatcher == nil`, every
-//     invoke() call POSTs a JSON envelope to `url`.
-//  2. In-process (Go-native): when `dispatcher != nil`, the URL field is
-//     ignored and every invoke() call dispatches to the in-process
-//     Dispatcher.
-//
-// The dual-mode design lets operators rollout the in-process filter
-// behind a feature flag without rewriting CRDs first. The controller
-// populates one or the other at compile time; the runtime never flips
-// between modes for an in-flight request.
+// Every invocation POSTs a JSON envelope to the configured `url`; the
+// filter service itself (an external process implementing the wire
+// protocol described in [contentFilterRequest]/[contentFilterResponse])
+// decides whether to pass, redact, or reject. Operators deploy the
+// content-filter binary from
+// panacea-agent/services/aigw-content-filter-dispatcher alongside the
+// gateway; any implementation that speaks the same wire protocol is
+// acceptable.
 type contentFilter struct {
 	url                     string
 	invokeOnRequest         bool
@@ -150,10 +146,6 @@ type contentFilter struct {
 	timeout                 time.Duration
 	failClosed              bool
 	forwardHeadersCanonical []string
-	// dispatcher, when non-nil, replaces the HTTP sidecar path with
-	// in-process dispatch. Shared across all goroutines; safe for
-	// concurrent use. See contentfilter_inprocess.go for the adapter.
-	dispatcher *Dispatcher
 	// mode is the compiled enforcement mode. Empty is treated as
 	// MCPContentFilterModeEnforce at invocation time so legacy
 	// configs keep their behavior.
@@ -219,25 +211,6 @@ func (cf *contentFilter) shadowSampleRateBounded() int32 {
 		return 1000
 	}
 	return r
-}
-
-// WithDispatcher returns cf with the given dispatcher attached. Returns
-// the same pointer so the call is chainable with compile*:
-//
-//	cf, err := compileContentFilter(spec, route, backend)
-//	if err != nil { ... }
-//	cf = cf.WithDispatcher(d)
-//
-// Calling WithDispatcher(nil) unsets the dispatcher (useful in tests).
-// A contentFilter is shared across goroutines so this method MUST be
-// called before the filter is published to handlers; mutating a live
-// filter is a race.
-func (cf *contentFilter) WithDispatcher(d *Dispatcher) *contentFilter {
-	if cf == nil {
-		return nil
-	}
-	cf.dispatcher = d
-	return cf
 }
 
 // compileContentFilter validates a filter configuration and returns its
@@ -546,24 +519,9 @@ func applyContentFilterOnRequestWithStatus(
 		return nil, FilterStatusUnavailable, fmt.Errorf("encode JSON-RPC request for content filter: %w", err)
 	}
 
-	var (
-		newBody   []byte
-		rejected  bool
-		reason    string
-		invokeErr error
-		started   = time.Now()
-	)
-	// Prefer in-process dispatch when a dispatcher is wired up; fall
-	// back to the HTTP sidecar path otherwise. The two branches are
-	// observationally equivalent: each returns (newBody, rejected,
-	// reason, err) with identical semantics.
-	if cf.dispatcher != nil {
-		newBody, rejected, reason, invokeErr = dispatchInProcess(ctx, cf.dispatcher,
-			ScopeRequest, routeName, backendName, req.Method, tool, headers, body)
-	} else {
-		newBody, rejected, reason, invokeErr = cf.invoke(ctx, client, contentFilterScopeRequest,
-			routeName, backendName, req.Method, tool, headers, body)
-	}
+	started := time.Now()
+	newBody, rejected, reason, invokeErr := cf.invoke(ctx, client, contentFilterScopeRequest,
+		routeName, backendName, req.Method, tool, headers, body)
 	elapsed := time.Since(started)
 
 	// Shadow-mode branch: never apply the verdict, always forward
@@ -680,22 +638,9 @@ func applyContentFilterOnResponseWithStatus(
 		method = req.Method
 	}
 
-	var (
-		newBody   []byte
-		rejected  bool
-		reason    string
-		invokeErr error
-		started   = time.Now()
-	)
-	// Same branch as the request path: dispatcher wins when present,
-	// HTTP sidecar is the fallback.
-	if cf.dispatcher != nil {
-		newBody, rejected, reason, invokeErr = dispatchInProcess(ctx, cf.dispatcher,
-			ScopeResponse, routeName, backendName, method, tool, headers, body)
-	} else {
-		newBody, rejected, reason, invokeErr = cf.invoke(ctx, client, contentFilterScopeResponse,
-			routeName, backendName, method, tool, headers, body)
-	}
+	started := time.Now()
+	newBody, rejected, reason, invokeErr := cf.invoke(ctx, client, contentFilterScopeResponse,
+		routeName, backendName, method, tool, headers, body)
 	elapsed := time.Since(started)
 
 	// Shadow-mode branch: forward the original response, record

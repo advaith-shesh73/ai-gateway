@@ -1,5 +1,0 @@
-{
-  "addr": ":9093",
-  "policy": "passthrough",
-  "timeoutSeconds": 10
-}

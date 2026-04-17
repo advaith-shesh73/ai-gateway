@@ -182,14 +182,33 @@ type MCPContentFilter struct {
 	// +optional
 	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
 
-	// FailurePolicy controls behaviour when the filter service is
-	// unreachable, returns a non-2xx status, returns a malformed response,
-	// or exceeds TimeoutSeconds.
+	// FailurePolicy controls behaviour when the gateway cannot obtain a
+	// definitive verdict from the filter service. This covers:
+	//   - connection refused / TCP reset / TLS handshake failure;
+	//   - filter service returns any non-2xx HTTP status;
+	//   - response body is not valid JSON or the action field is not one of
+	//     pass, redact, reject;
+	//   - the filter call exceeds TimeoutSeconds (gateway cancels the
+	//     request and treats it as failure).
+	//
+	// A filter that responds cleanly with action=reject is NOT a failure —
+	// it is a deliberate verdict and the gateway always honours it
+	// regardless of FailurePolicy (see error code -32010 on the client).
+	//
 	// - "PassThrough": the original JSON-RPC message is used and the tool
-	//   call continues. This is fail-open and is the default.
-	// - "Fail":        the gateway returns a JSON-RPC error to the client.
-	//   Use this for evaluation workloads where an unscanned response must
-	//   never be served.
+	//   call continues. This is fail-open: the filter outage becomes
+	//   invisible to end-users but the gateway does NOT get to inspect the
+	//   body. Appropriate for filters whose role is best-effort redaction.
+	// - "Fail":        the gateway returns a JSON-RPC error to the client
+	//   (code -32011) and does NOT forward the request/response. This is
+	//   fail-closed. Appropriate for evaluation and compliance workloads
+	//   where an unscanned response is worse than no response.
+	//
+	// Every failure is observable regardless of policy: the gateway emits
+	// X-Content-Filter-Status=failed-open or unavailable, increments
+	// mcp_filter_status_total with the corresponding status label, and
+	// logs the underlying transport/parse/timeout error. Operators should
+	// page on sustained failed-open rates even when configured fail-open.
 	//
 	// Defaults to "PassThrough".
 	//
@@ -202,8 +221,20 @@ type MCPContentFilter struct {
 	// case-insensitive. This enables tenant- or context-aware policy (for
 	// example, forwarding an evaluation-run ticket ID or a tenant ID).
 	//
-	// Authorization and other sensitive headers are NOT automatically
-	// forwarded; if the filter needs them, list them explicitly.
+	// SECURITY: the filter service receives every header named here
+	// verbatim. Treat each entry as an intentional trust-boundary
+	// decision: the filter host, its logs, and any sidecar/network
+	// observer between the gateway and filter can observe the value.
+	//   - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,
+	//     or any header carrying a bearer token, session identifier, or
+	//     long-lived credential unless the filter is explicitly in-scope
+	//     for handling those secrets.
+	//   - Prefer opaque identifiers (request ID, tenant ID, evaluation
+	//     ticket ID) over headers derived from end-user credentials.
+	//   - If the filter runs in a different Kubernetes namespace or trust
+	//     zone than the gateway, forwarding user-bearing headers widens
+	//     the blast radius of a filter compromise.
+	// When in doubt, omit the header.
 	//
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MaxItems=16
@@ -211,15 +242,14 @@ type MCPContentFilter struct {
 	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
 
 	// Mode selects between Enforce (default) and Shadow. In Shadow mode
-	// the gateway still invokes the filter service (or in-process
-	// dispatcher), records the would-be verdict via
-	// X-Content-Filter-Status and mcp_filter_decisions_total, and emits
-	// redaction audit events, but always forwards the ORIGINAL body to
-	// the client (and backend on Request scope). Use Shadow during
-	// pre-production rollout to measure false-positive and
-	// false-negative rates on real traffic without impacting users.
-	// Operators flip back to Enforce to activate actual enforcement
-	// without a gateway restart.
+	// the gateway still invokes the filter service, records the
+	// would-be verdict via X-Content-Filter-Status and
+	// mcp_filter_decisions_total, and emits redaction audit events, but
+	// always forwards the ORIGINAL body to the client (and backend on
+	// Request scope). Use Shadow during pre-production rollout to
+	// measure false-positive and false-negative rates on real traffic
+	// without impacting users. Operators flip back to Enforce to
+	// activate actual enforcement without a gateway restart.
 	//
 	// Defaults to "Enforce".
 	//

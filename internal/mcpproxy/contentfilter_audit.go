@@ -34,8 +34,8 @@ type RedactionAuditEvent struct {
 	// stamp on arrival), but providing it here lets offline replays
 	// reconstruct ordering without relying on log-arrival jitter.
 	Timestamp time.Time
-	// Route is the FilterRequest route label (may be empty when the
-	// call originated from a code path without route tagging, e.g.
+	// Route is the MCPRoute label (may be empty when the call
+	// originated from a code path without route tagging, e.g.
 	// background refresh jobs). Prefer to always set this.
 	Route string
 	// Backend is the downstream backend label (may be empty).
