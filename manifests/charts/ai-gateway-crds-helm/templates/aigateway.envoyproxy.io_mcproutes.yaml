@@ -1,8 +1,3 @@
-# Copyright Envoy AI Gateway Authors
-# SPDX-License-Identifier: Apache-2.0
-# The full text of the Apache license is available in the LICENSE file at
-# the root of the repo.
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -66,6 +61,87 @@ spec:
                   description: MCPRouteBackendRef wraps a EG's BackendObjectReference
                     to reference an MCP server.
                   properties:
+                    contentFilter:
+                      description: |-
+                        ContentFilter configures an optional external HTTP service that inspects
+                        and may rewrite "tools/call" payloads for this backend before they are
+                        forwarded to the MCP server (request scope) and/or after the response
+                        is returned (response scope).
+
+                        Typical uses are PII scrubbing and evaluation-mode source exclusion,
+                        where the gateway needs to rewrite request parameters or response
+                        content according to an external policy service.
+                      properties:
+                        failurePolicy:
+                          description: |-
+                            FailurePolicy controls behaviour when the filter service is
+                            unreachable, returns a non-2xx status, returns a malformed response,
+                            or exceeds TimeoutSeconds.
+                            - "PassThrough": the original JSON-RPC message is used and the tool
+                              call continues. This is fail-open and is the default.
+                            - "Fail":        the gateway returns a JSON-RPC error to the client.
+                              Use this for evaluation workloads where an unscanned response must
+                              never be served.
+
+                            Defaults to "PassThrough".
+                          enum:
+                          - PassThrough
+                          - Fail
+                          type: string
+                        forwardHeaders:
+                          description: |-
+                            ForwardHeaders lists HTTP header names to copy from the client's
+                            incoming request into the filter invocation. Header names are
+                            case-insensitive. This enables tenant- or context-aware policy (for
+                            example, forwarding an evaluation-run ticket ID or a tenant ID).
+
+                            Authorization and other sensitive headers are NOT automatically
+                            forwarded; if the filter needs them, list them explicitly.
+                          items:
+                            type: string
+                          maxItems: 16
+                          type: array
+                        scopes:
+                          description: |-
+                            Scopes selects which phases of the tools/call lifecycle are sent to
+                            the filter. At least one must be specified.
+                            - "Request":  invoked before the tools/call is forwarded to the backend.
+                            - "Response": invoked after the backend returns, before the response is
+                              written to the client.
+                          items:
+                            description: MCPContentFilterScope selects a phase of
+                              the tools/call lifecycle.
+                            enum:
+                            - Request
+                            - Response
+                            type: string
+                          maxItems: 2
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
+                        timeoutSeconds:
+                          description: |-
+                            TimeoutSeconds is the per-invocation timeout applied when calling the
+                            filter service. If the filter does not respond before this deadline,
+                            FailurePolicy is applied.
+
+                            Defaults to 10 seconds. Must be between 1 and 120 inclusive.
+                          format: int32
+                          maximum: 120
+                          minimum: 1
+                          type: integer
+                        url:
+                          description: |-
+                            URL is the HTTP endpoint of the content filter service. Must use the
+                            http:// or https:// scheme. No other schemes are supported.
+                          maxLength: 1024
+                          minLength: 1
+                          pattern: ^https?://.+$
+                          type: string
+                      required:
+                      - scopes
+                      - url
+                      type: object
                     group:
                       default: ""
                       description: |-

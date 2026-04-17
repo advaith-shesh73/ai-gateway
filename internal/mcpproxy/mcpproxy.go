@@ -37,6 +37,19 @@ type mcpRequestContext struct {
 	requestHeaders            http.Header
 	originalPath              string
 	perBackendMetricsRecorded bool
+
+	// reqScopeFilterStatus, reqScopeFilterRoute, and reqScopeFilterBackend
+	// capture the Request-scope content-filter outcome so that the proxied
+	// response can still emit an X-Content-Filter-Status header even when
+	// no Response-scope filter is configured. The Response-scope path (see
+	// proxyResponseBody) will overwrite these values with its own outcome
+	// when it runs — the Response-scope outcome is the authoritative one
+	// whenever both scopes fire. Zero value ("") is treated as "no
+	// Request-scope filter ran", which suppresses the header (preserves
+	// pre-L04 behavior for routes with no filter at all).
+	reqScopeFilterStatus  FilterStatus
+	reqScopeFilterRoute   filterapi.MCPRouteName
+	reqScopeFilterBackend filterapi.MCPBackendName
 }
 
 // NewMCPProxy creates a new MCPProxy instance.

@@ -27,6 +27,7 @@ The MCP Gateway acts as a transparent proxy between MCP clients (AI agents like 
 | **Fine-Grained Authorization**         | Native enforcement of [OAuth authentication flows](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).<br/>Implement granular access control using JWT claims, scopes, and CEL expressions.                                              |
 | **Server Multiplexing & Tool Routing** | Route tool calls to the right MCP backends, aggregating and filtering available tools based on gateway policy.<br/>Dynamically merge streaming notifications from multiple MCP servers into a unified interface.                                                    |
 | **Upstream Authentication**            | Built-in upstream authentication primitives to securely connect to external MCP servers using API keys and header injection.                                                                                                                                        |
+| **Content Filters**                    | Delegate per-backend `tools/call` request and response inspection to an external HTTP service. Supports payload rewrite, source-level exclusions, PII redaction, and hard reject, with configurable timeout and fail-open/fail-closed policy.                       |
 | **Full MCP Spec Coverage**             | Complete [June 2025 MCP spec](https://modelcontextprotocol.io/specification/2025-06-18) compliance, including support for tool calls, notifications, prompts, resources, and bi-directional server-to-client requests.                                              |
 | **Built-in Observability**             | OpenTelemetry tracing and Prometheus metrics for all MCP requests, using the same observability stack as LLM traffic.                                                                                                                                               |
 
@@ -365,6 +366,98 @@ authorization:
           - backend: mcp-backend
             tool: sum
 ```
+
+### Content Filters
+
+Content filters let you delegate per-backend request and response inspection
+to an external HTTP service. They are configured on a `MCPRouteBackendRef`
+and run at tool-call time, giving the filter the chance to observe, rewrite,
+or reject individual `tools/call` payloads without the gateway understanding
+the domain-specific shape of the tool.
+
+Typical uses include:
+
+- Injecting source-level exclusions (for example, an `exclude_ticket_ids`
+  parameter) so a backend never sees data it should not search.
+- Detecting and redacting PII in tool responses before they reach the caller.
+- Replacing a raw backend response with a sanitized version (for example,
+  a "creation-time" recreation of a ticket rather than its current state).
+
+The filter is invoked separately at each configured scope:
+
+- `Request` &mdash; runs **before** the gateway forwards the tool call to the
+  backend. The filter can rewrite the JSON-RPC request or reject the call.
+- `Response` &mdash; runs **after** the backend response is received and any
+  built-in response modifications have been applied, but before the response
+  is written back to the client. The filter can rewrite the JSON-RPC
+  response or reject it.
+
+#### Configuration
+
+```yaml
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: mcp-route
+spec:
+  backendRefs:
+    - name: supportgpt
+      contentFilter:
+        url: http://content-filter.mcp.svc.cluster.local:8080/filter
+        scopes: [Request, Response]
+        timeoutSeconds: 10
+        failurePolicy: PassThrough
+        forwardHeaders:
+          - x-request-id
+          - x-tenant-id
+```
+
+| Field            | Description                                                                                                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`            | HTTP endpoint of the filter service. Must use `http://` or `https://`.                                                                                                                                                            |
+| `scopes`         | One or both of `Request` and `Response`. The filter is only invoked at the scopes listed here.                                                                                                                                    |
+| `timeoutSeconds` | Per-invocation timeout (default `10`, max `120`).                                                                                                                                                                                 |
+| `failurePolicy`  | `PassThrough` (default) forwards the unmodified payload when the filter is unreachable or errors. `Fail` aborts the tool call with a JSON-RPC error. Reject responses from the filter always abort the call regardless of policy. |
+| `forwardHeaders` | Optional list of client-request header names that are copied into the filter request (case-insensitive, at most 16 entries).                                                                                                      |
+
+#### Wire Protocol
+
+The gateway `POST`s a JSON envelope to the filter URL and expects a JSON
+envelope back. The body of the tool call is base64-encoded so it can carry
+arbitrary byte sequences without re-encoding.
+
+Request (gateway &rarr; filter):
+
+```json
+{
+  "route": "mcp-route",
+  "backend": "supportgpt",
+  "scope": "Request",
+  "mcpMethod": "tools/call",
+  "tool": "lookup",
+  "headers": { "x-tenant-id": "acme" },
+  "bodyBase64": "eyJqc29ucnBjIjoiMi4wIiwgLi4uIH0=",
+  "contentType": "application/json"
+}
+```
+
+Response (filter &rarr; gateway):
+
+```json
+{
+  "action": "redact",
+  "bodyBase64": "eyJqc29ucnBjIjoiMi4wIiwgLi4uIH0=",
+  "reason": "removed PII from result"
+}
+```
+
+`action` must be one of `pass`, `redact`, or `reject`. `redact` requires a
+`bodyBase64` replacement; `reject` optionally carries a `reason` string that
+is surfaced to the caller via the JSON-RPC error envelope.
+
+When the filter is unavailable the gateway applies `failurePolicy`; when the
+filter returns `reject` the gateway always emits a JSON-RPC error
+(`-32010 content filter rejected request|response`) regardless of policy.
 
 ## See Also
 

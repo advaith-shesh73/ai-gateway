@@ -495,6 +495,9 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 					ExcludeRegex: b.ToolSelector.ExcludeRegex,
 				}
 			}
+			if b.ContentFilter != nil {
+				mcpBackend.ContentFilter = translateContentFilter(b.ContentFilter)
+			}
 			mcpRoute.Backends = append(
 				mcpRoute.Backends, mcpBackend)
 		}
@@ -567,6 +570,30 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 		mc.Routes = append(mc.Routes, mcpRoute)
 	}
 	return mc, hasEffectiveRoute
+}
+
+// translateContentFilter converts the CRD representation of a per-backend
+// content filter into the runtime filterapi representation. The CRD uses
+// optional pointers for fields that have defaults; those defaults are
+// resolved by the proxy at runtime, so we forward zero values as-is here.
+func translateContentFilter(cf *aigv1a1.MCPContentFilter) *filterapi.MCPContentFilter {
+	if cf == nil {
+		return nil
+	}
+	scopes := make([]filterapi.MCPContentFilterScope, 0, len(cf.Scopes))
+	for _, s := range cf.Scopes {
+		scopes = append(scopes, filterapi.MCPContentFilterScope(s))
+	}
+	out := &filterapi.MCPContentFilter{
+		URL:            cf.URL,
+		Scopes:         scopes,
+		TimeoutSeconds: ptr.Deref(cf.TimeoutSeconds, 0),
+		ForwardHeaders: append([]string(nil), cf.ForwardHeaders...),
+	}
+	if cf.FailurePolicy != nil {
+		out.FailurePolicy = filterapi.MCPContentFilterFailurePolicy(*cf.FailurePolicy)
+	}
+	return out
 }
 
 func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy) (*filterapi.BackendAuth, error) {

@@ -1788,6 +1788,107 @@ func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
 	require.Equal(t, []string{"^secret.*"}, ts.ExcludeRegex)
 }
 
+func Test_mcpConfig_ContentFilter(t *testing.T) {
+	timeout := int32(30)
+	failPolicy := aigv1a1.MCPContentFilterFailurePolicyFail
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{
+						// Backend with both scopes and a custom failure
+						// policy, timeout, and forward headers.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("supportgpt"),
+						},
+						ContentFilter: &aigv1a1.MCPContentFilter{
+							URL: "http://content-filter.svc.cluster.local:8080/filter",
+							Scopes: []aigv1a1.MCPContentFilterScope{
+								aigv1a1.MCPContentFilterScopeRequest,
+								aigv1a1.MCPContentFilterScopeResponse,
+							},
+							TimeoutSeconds: &timeout,
+							FailurePolicy:  &failPolicy,
+							ForwardHeaders: []string{"x-ticket-id", "x-request-id"},
+						},
+					},
+					{
+						// Backend with no content filter at all.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("plain"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mc, effective := mcpConfig(mcpRoutes)
+	require.True(t, effective)
+	require.NotNil(t, mc)
+	require.Len(t, mc.Routes, 1)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	// Sort-stable lookup so the test isn't sensitive to slice ordering.
+	var withCF, withoutCF *filterapi.MCPBackend
+	for i := range mc.Routes[0].Backends {
+		b := &mc.Routes[0].Backends[i]
+		if b.Name == "supportgpt" {
+			withCF = b
+		} else {
+			withoutCF = b
+		}
+	}
+	require.NotNil(t, withCF)
+	require.NotNil(t, withoutCF)
+
+	require.Nil(t, withoutCF.ContentFilter, "backends without contentFilter spec must translate to nil")
+
+	cf := withCF.ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, "http://content-filter.svc.cluster.local:8080/filter", cf.URL)
+	require.ElementsMatch(t,
+		[]filterapi.MCPContentFilterScope{
+			filterapi.MCPContentFilterScopeRequest,
+			filterapi.MCPContentFilterScopeResponse,
+		},
+		cf.Scopes,
+	)
+	require.Equal(t, int32(30), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicyFail, cf.FailurePolicy)
+	require.Equal(t, []string{"x-ticket-id", "x-request-id"}, cf.ForwardHeaders)
+}
+
+func Test_mcpConfig_ContentFilter_Defaults(t *testing.T) {
+	// When TimeoutSeconds and FailurePolicy are unset on the CRD, the
+	// translated config must expose them as zero values so that
+	// compileContentFilter can apply its defaults (10s / PassThrough).
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{
+						Name: gwapiv1.ObjectName("b"),
+					},
+					ContentFilter: &aigv1a1.MCPContentFilter{
+						URL:    "https://cf.example.com",
+						Scopes: []aigv1a1.MCPContentFilterScope{aigv1a1.MCPContentFilterScopeRequest},
+					},
+				}},
+			},
+		},
+	}
+	mc, effective := mcpConfig(mcpRoutes)
+	require.True(t, effective)
+	cf := mc.Routes[0].Backends[0].ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, int32(0), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicy(""), cf.FailurePolicy)
+	require.Empty(t, cf.ForwardHeaders)
+}
+
 func Test_mergeHeaderMutations(t *testing.T) {
 	tests := []struct {
 		name         string

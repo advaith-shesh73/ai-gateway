@@ -593,6 +593,9 @@ QuotaPolicyList contains a list of QuotaPolicy
 - [MCPAuthorizationTarget](#mcpauthorizationtarget)
 - [MCPBackendAPIKey](#mcpbackendapikey)
 - [MCPBackendSecurityPolicy](#mcpbackendsecuritypolicy)
+- [MCPContentFilter](#mcpcontentfilter)
+- [MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)
+- [MCPContentFilterScope](#mcpcontentfilterscope)
 - [MCPRouteAuthorization](#mcprouteauthorization)
 - [MCPRouteAuthorizationRule](#mcprouteauthorizationrule)
 - [MCPRouteBackendRef](#mcproutebackendref)
@@ -1833,6 +1836,106 @@ MCPBackendSecurityPolicy defines the security policy for a sp
 />
 
 
+#### MCPContentFilter
+
+
+
+**Appears in:**
+- [MCPRouteBackendRef](#mcproutebackendref)
+
+MCPContentFilter configures an external HTTP service that inspects and
+optionally rewrites MCP "tools/call" payloads for a single backend.
+
+For each invocation that matches one of the configured Scopes, the gateway
+POSTs a JSON envelope to URL containing the JSON-RPC message and a subset
+of the client's HTTP headers (selected by ForwardHeaders). The service
+replies with an action of pass, redact, or reject. On redact, the
+replacement JSON-RPC message supplied by the filter is forwarded in place
+of the original. On reject, the gateway returns a JSON-RPC error to the
+client and does not contact the backend (request scope) or forward the
+response (response scope).
+
+##### Fields
+
+
+
+<ApiField
+  name="url"
+  type="string"
+  required="true"
+  description="URL is the HTTP endpoint of the content filter service. Must use the<br />http:// or https:// scheme. No other schemes are supported."
+/><ApiField
+  name="scopes"
+  type="[MCPContentFilterScope](#mcpcontentfilterscope) array"
+  required="true"
+  description="Scopes selects which phases of the tools/call lifecycle are sent to<br />the filter. At least one must be specified.<br />- `Request`:  invoked before the tools/call is forwarded to the backend.<br />- `Response`: invoked after the backend returns, before the response is<br />  written to the client."
+/><ApiField
+  name="timeoutSeconds"
+  type="integer"
+  required="false"
+  description="TimeoutSeconds is the per-invocation timeout applied when calling the<br />filter service. If the filter does not respond before this deadline,<br />FailurePolicy is applied.<br />Defaults to 10 seconds. Must be between 1 and 120 inclusive."
+/><ApiField
+  name="failurePolicy"
+  type="[MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)"
+  required="false"
+  description="FailurePolicy controls behaviour when the filter service is<br />unreachable, returns a non-2xx status, returns a malformed response,<br />or exceeds TimeoutSeconds.<br />- `PassThrough`: the original JSON-RPC message is used and the tool<br />  call continues. This is fail-open and is the default.<br />- `Fail`:        the gateway returns a JSON-RPC error to the client.<br />  Use this for evaluation workloads where an unscanned response must<br />  never be served.<br />Defaults to `PassThrough`."
+/><ApiField
+  name="forwardHeaders"
+  type="string array"
+  required="false"
+  description="ForwardHeaders lists HTTP header names to copy from the client's<br />incoming request into the filter invocation. Header names are<br />case-insensitive. This enables tenant- or context-aware policy (for<br />example, forwarding an evaluation-run ticket ID or a tenant ID).<br />Authorization and other sensitive headers are NOT automatically<br />forwarded; if the filter needs them, list them explicitly."
+/>
+
+
+#### MCPContentFilterFailurePolicy
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilter](#mcpcontentfilter)
+
+MCPContentFilterFailurePolicy controls how the gateway reacts when the
+filter service is unavailable or errors.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="PassThrough"
+  type="enum"
+  required="false"
+  description="MCPContentFilterFailurePolicyPassThrough forwards the unmodified<br />request or response when the filter service cannot be consulted.<br />This is the default and is fail-open.<br />"
+/><ApiField
+  name="Fail"
+  type="enum"
+  required="false"
+  description="MCPContentFilterFailurePolicyFail causes the tool call to fail with a<br />JSON-RPC error when the filter service cannot be consulted. Use this<br />when serving unscanned content is worse than failing the call.<br />"
+/>
+#### MCPContentFilterScope
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilter](#mcpcontentfilter)
+
+MCPContentFilterScope selects a phase of the tools/call lifecycle.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="Request"
+  type="enum"
+  required="false"
+  description="MCPContentFilterScopeRequest invokes the filter before forwarding the<br />tools/call request to the backend.<br />"
+/><ApiField
+  name="Response"
+  type="enum"
+  required="false"
+  description="MCPContentFilterScopeResponse invokes the filter after the backend<br />responds, before the response is written to the client.<br />"
+/>
 #### MCPRouteAuthorization
 
 
@@ -1953,6 +2056,11 @@ MCPRouteBackendRef wraps a EG's BackendObjectReference to reference an MCP serve
   type="[MCPBackendSecurityPolicy](#mcpbackendsecuritypolicy)"
   required="false"
   description="SecurityPolicy is the security policy to apply to this MCP server."
+/><ApiField
+  name="contentFilter"
+  type="[MCPContentFilter](#mcpcontentfilter)"
+  required="false"
+  description="ContentFilter configures an optional external HTTP service that inspects<br />and may rewrite `tools/call` payloads for this backend before they are<br />forwarded to the MCP server (request scope) and/or after the response<br />is returned (response scope).<br />Typical uses are PII scrubbing and evaluation-mode source exclusion,<br />where the gateway needs to rewrite request parameters or response<br />content according to an external policy service."
 />
 
 

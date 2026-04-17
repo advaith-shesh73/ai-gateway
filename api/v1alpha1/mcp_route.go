@@ -121,8 +121,126 @@ type MCPRouteBackendRef struct {
 	// +optional
 	SecurityPolicy *MCPBackendSecurityPolicy `json:"securityPolicy,omitempty"`
 
+	// ContentFilter configures an optional external HTTP service that inspects
+	// and may rewrite "tools/call" payloads for this backend before they are
+	// forwarded to the MCP server (request scope) and/or after the response
+	// is returned (response scope).
+	//
+	// Typical uses are PII scrubbing and evaluation-mode source exclusion,
+	// where the gateway needs to rewrite request parameters or response
+	// content according to an external policy service.
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	ContentFilter *MCPContentFilter `json:"contentFilter,omitempty"`
+
 	// TODO: add fancy per-MCP server config. For example, Rate Limit, etc.
 }
+
+// MCPContentFilter configures an external HTTP service that inspects and
+// optionally rewrites MCP "tools/call" payloads for a single backend.
+//
+// For each invocation that matches one of the configured Scopes, the gateway
+// POSTs a JSON envelope to URL containing the JSON-RPC message and a subset
+// of the client's HTTP headers (selected by ForwardHeaders). The service
+// replies with an action of pass, redact, or reject. On redact, the
+// replacement JSON-RPC message supplied by the filter is forwarded in place
+// of the original. On reject, the gateway returns a JSON-RPC error to the
+// client and does not contact the backend (request scope) or forward the
+// response (response scope).
+type MCPContentFilter struct {
+	// URL is the HTTP endpoint of the content filter service. Must use the
+	// http:// or https:// scheme. No other schemes are supported.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern=`^https?://.+$`
+	URL string `json:"url"`
+
+	// Scopes selects which phases of the tools/call lifecycle are sent to
+	// the filter. At least one must be specified.
+	// - "Request":  invoked before the tools/call is forwarded to the backend.
+	// - "Response": invoked after the backend returns, before the response is
+	//   written to the client.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +listType=set
+	Scopes []MCPContentFilterScope `json:"scopes"`
+
+	// TimeoutSeconds is the per-invocation timeout applied when calling the
+	// filter service. If the filter does not respond before this deadline,
+	// FailurePolicy is applied.
+	//
+	// Defaults to 10 seconds. Must be between 1 and 120 inclusive.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=120
+	// +optional
+	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
+
+	// FailurePolicy controls behaviour when the filter service is
+	// unreachable, returns a non-2xx status, returns a malformed response,
+	// or exceeds TimeoutSeconds.
+	// - "PassThrough": the original JSON-RPC message is used and the tool
+	//   call continues. This is fail-open and is the default.
+	// - "Fail":        the gateway returns a JSON-RPC error to the client.
+	//   Use this for evaluation workloads where an unscanned response must
+	//   never be served.
+	//
+	// Defaults to "PassThrough".
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	FailurePolicy *MCPContentFilterFailurePolicy `json:"failurePolicy,omitempty"`
+
+	// ForwardHeaders lists HTTP header names to copy from the client's
+	// incoming request into the filter invocation. Header names are
+	// case-insensitive. This enables tenant- or context-aware policy (for
+	// example, forwarding an evaluation-run ticket ID or a tenant ID).
+	//
+	// Authorization and other sensitive headers are NOT automatically
+	// forwarded; if the filter needs them, list them explicitly.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+}
+
+// MCPContentFilterScope selects a phase of the tools/call lifecycle.
+//
+// +kubebuilder:validation:Enum=Request;Response
+type MCPContentFilterScope string
+
+const (
+	// MCPContentFilterScopeRequest invokes the filter before forwarding the
+	// tools/call request to the backend.
+	MCPContentFilterScopeRequest MCPContentFilterScope = "Request"
+	// MCPContentFilterScopeResponse invokes the filter after the backend
+	// responds, before the response is written to the client.
+	MCPContentFilterScopeResponse MCPContentFilterScope = "Response"
+)
+
+// MCPContentFilterFailurePolicy controls how the gateway reacts when the
+// filter service is unavailable or errors.
+//
+// +kubebuilder:validation:Enum=PassThrough;Fail
+type MCPContentFilterFailurePolicy string
+
+const (
+	// MCPContentFilterFailurePolicyPassThrough forwards the unmodified
+	// request or response when the filter service cannot be consulted.
+	// This is the default and is fail-open.
+	MCPContentFilterFailurePolicyPassThrough MCPContentFilterFailurePolicy = "PassThrough"
+	// MCPContentFilterFailurePolicyFail causes the tool call to fail with a
+	// JSON-RPC error when the filter service cannot be consulted. Use this
+	// when serving unscanned content is worse than failing the call.
+	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
 
 // MCPToolFilter filters tools using include and exclude patterns with exact matches or regular expressions.
 // Exclude rules take precedence over include rules (deny-wins). When both include and exclude are specified,

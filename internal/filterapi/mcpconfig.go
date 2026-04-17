@@ -43,7 +43,62 @@ type MCPBackend struct {
 
 	// ToolSelector filters the tools exposed by this backend. If not set, all tools are exposed.
 	ToolSelector *MCPToolSelector `json:"toolSelector,omitempty"`
+
+	// ContentFilter configures an external HTTP service that inspects and may
+	// rewrite tools/call payloads for this backend. Nil means no content
+	// filtering is applied. See MCPContentFilter for semantics.
+	ContentFilter *MCPContentFilter `json:"contentFilter,omitempty"`
 }
+
+// MCPContentFilter is the runtime representation of an external HTTP content
+// filter for a single MCP backend. It mirrors
+// [aigv1a1.MCPContentFilter] with primitive types only so it can be
+// serialized into the proxy config file.
+type MCPContentFilter struct {
+	// URL is the HTTP(S) endpoint of the content filter service. Must include
+	// a scheme (http:// or https://).
+	URL string `json:"url"`
+
+	// Scopes selects the phases at which the filter is invoked. Valid
+	// members are "Request" and "Response". At least one is required.
+	Scopes []MCPContentFilterScope `json:"scopes"`
+
+	// TimeoutSeconds is the per-invocation timeout for the filter HTTP call.
+	// A value of 0 indicates that the default should be used.
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// FailurePolicy controls behaviour when the filter cannot be consulted.
+	// An empty value indicates that the default (PassThrough) should be used.
+	FailurePolicy MCPContentFilterFailurePolicy `json:"failurePolicy,omitempty"`
+
+	// ForwardHeaders is the case-insensitive list of client HTTP headers
+	// forwarded into each filter invocation.
+	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+}
+
+// MCPContentFilterScope is the runtime mirror of
+// [aigv1a1.MCPContentFilterScope].
+type MCPContentFilterScope string
+
+const (
+	// MCPContentFilterScopeRequest invokes the filter before the backend call.
+	MCPContentFilterScopeRequest MCPContentFilterScope = "Request"
+	// MCPContentFilterScopeResponse invokes the filter after the backend call.
+	MCPContentFilterScopeResponse MCPContentFilterScope = "Response"
+)
+
+// MCPContentFilterFailurePolicy is the runtime mirror of
+// [aigv1a1.MCPContentFilterFailurePolicy].
+type MCPContentFilterFailurePolicy string
+
+const (
+	// MCPContentFilterFailurePolicyPassThrough forwards unmodified payloads
+	// when the filter cannot be consulted.
+	MCPContentFilterFailurePolicyPassThrough MCPContentFilterFailurePolicy = "PassThrough"
+	// MCPContentFilterFailurePolicyFail aborts the tool call when the filter
+	// cannot be consulted.
+	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
 
 // MCPBackendName is the name of the MCP backend.
 type MCPBackendName = string

@@ -41,6 +41,7 @@ type (
 	mcpProxyConfigRoute struct {
 		backends       map[filterapi.MCPBackendName]filterapi.MCPBackend
 		toolSelectors  map[filterapi.MCPBackendName]*toolSelector
+		contentFilters map[filterapi.MCPBackendName]*contentFilter
 		authorization  *compiledAuthorization
 		forwardHeaders []string
 	}
@@ -198,6 +199,7 @@ func (p *ProxyConfig) LoadConfig(_ context.Context, config *filterapi.Config) er
 		r := &mcpProxyConfigRoute{
 			backends:       make(map[filterapi.MCPBackendName]filterapi.MCPBackend, len(route.Backends)),
 			toolSelectors:  make(map[filterapi.MCPBackendName]*toolSelector, len(route.Backends)),
+			contentFilters: make(map[filterapi.MCPBackendName]*contentFilter, len(route.Backends)),
 			authorization:  compiledAuth,
 			forwardHeaders: route.ForwardHeaders,
 		}
@@ -225,6 +227,15 @@ func (p *ProxyConfig) LoadConfig(_ context.Context, config *filterapi.Config) er
 				}
 				ts.excludeRegexps = excludeRegexps
 				r.toolSelectors[backend.Name] = ts
+			}
+			if backend.ContentFilter != nil {
+				compiled, err := compileContentFilter(backend.ContentFilter, route.Name, backend.Name)
+				if err != nil {
+					return err
+				}
+				if compiled != nil {
+					r.contentFilters[backend.Name] = compiled
+				}
 			}
 		}
 		newConfig.routes[route.Name] = r
