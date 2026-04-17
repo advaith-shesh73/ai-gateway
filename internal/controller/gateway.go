@@ -585,13 +585,24 @@ func translateContentFilter(cf *aigv1a1.MCPContentFilter) *filterapi.MCPContentF
 		scopes = append(scopes, filterapi.MCPContentFilterScope(s))
 	}
 	out := &filterapi.MCPContentFilter{
-		URL:            cf.URL,
-		Scopes:         scopes,
-		TimeoutSeconds: ptr.Deref(cf.TimeoutSeconds, 0),
-		ForwardHeaders: append([]string(nil), cf.ForwardHeaders...),
+		URL:                      cf.URL,
+		Scopes:                   scopes,
+		TimeoutSeconds:           ptr.Deref(cf.TimeoutSeconds, 0),
+		ForwardHeaders:           append([]string(nil), cf.ForwardHeaders...),
+		ShadowSampleRatePermille: ptr.Deref(cf.ShadowSampleRatePermille, 0),
 	}
 	if cf.FailurePolicy != nil {
 		out.FailurePolicy = filterapi.MCPContentFilterFailurePolicy(*cf.FailurePolicy)
+	}
+	if cf.Mode != nil {
+		out.Mode = filterapi.MCPContentFilterMode(*cf.Mode)
+	}
+	// Enabled is forwarded by pointer so the runtime can distinguish
+	// "unset (default true)" from "explicitly false". The CRD and
+	// runtime share the same nullable-bool contract.
+	if cf.Enabled != nil {
+		b := *cf.Enabled
+		out.Enabled = &b
 	}
 	return out
 }

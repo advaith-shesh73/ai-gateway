@@ -595,6 +595,7 @@ QuotaPolicyList contains a list of QuotaPolicy
 - [MCPBackendSecurityPolicy](#mcpbackendsecuritypolicy)
 - [MCPContentFilter](#mcpcontentfilter)
 - [MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)
+- [MCPContentFilterMode](#mcpcontentfiltermode)
 - [MCPContentFilterScope](#mcpcontentfilterscope)
 - [MCPRouteAuthorization](#mcprouteauthorization)
 - [MCPRouteAuthorizationRule](#mcprouteauthorizationrule)
@@ -1884,6 +1885,21 @@ response (response scope).
   type="string array"
   required="false"
   description="ForwardHeaders lists HTTP header names to copy from the client's<br />incoming request into the filter invocation. Header names are<br />case-insensitive. This enables tenant- or context-aware policy (for<br />example, forwarding an evaluation-run ticket ID or a tenant ID).<br />Authorization and other sensitive headers are NOT automatically<br />forwarded; if the filter needs them, list them explicitly."
+/><ApiField
+  name="mode"
+  type="[MCPContentFilterMode](#mcpcontentfiltermode)"
+  required="false"
+  description="Mode selects between Enforce (default) and Shadow. In Shadow mode<br />the gateway still invokes the filter service (or in-process<br />dispatcher), records the would-be verdict via<br />X-Content-Filter-Status and mcp_filter_decisions_total, and emits<br />redaction audit events, but always forwards the ORIGINAL body to<br />the client (and backend on Request scope). Use Shadow during<br />pre-production rollout to measure false-positive and<br />false-negative rates on real traffic without impacting users.<br />Operators flip back to Enforce to activate actual enforcement<br />without a gateway restart.<br />Defaults to `Enforce`."
+/><ApiField
+  name="enabled"
+  type="boolean"
+  required="false"
+  description="Enabled toggles the filter for this backend without removing the<br />configuration. When set to false the gateway forwards the tool<br />call as if no content filter were configured for this backend and<br />reports X-Content-Filter-Status: disabled on the response.<br />Preserving the rest of the configuration lets operators<br />re-enable the filter (possibly with adjusted Mode or<br />FailurePolicy) via a single CRD update, without re-entering<br />URL, scopes, timeout, or headers.<br />Defaults to true. Use the process-wide kill switch<br />(MCPContentFilterPolicy.GlobalDisable, distributed via the<br />policy ConfigMap) to disable every filter in one step during<br />an incident."
+/><ApiField
+  name="shadowSampleRatePermille"
+  type="integer"
+  required="false"
+  description="ShadowSampleRatePermille bounds the fraction of invocations<br />actually evaluated when Mode is Shadow. It is expressed in<br />permille (parts per thousand, 0..1000) so operators can set<br />0.1% granularity on high-traffic backends without switching<br />to floating point. A value of 1000 means every shadow-mode<br />invocation is evaluated (default, preserves backward compat).<br />A value of 0 means the filter is never invoked and every<br />shadow-mode call records action=shadow_sampled_out.<br />Sampling happens BEFORE the filter service is contacted, so<br />values < 1000 provide a hard cost and latency budget: an<br />operator running shadow mode against an expensive LLM-based<br />filter can cap traffic at e.g. 10 permille (1 %) while still<br />producing a statistically meaningful sample for<br />false-positive / false-negative dashboards.<br />Ignored when Mode is Enforce (enforcement always evaluates<br />every call — sampling enforcement would leak content).<br />Defaults to 1000."
 />
 
 
@@ -1911,6 +1927,30 @@ filter service is unavailable or errors.
   type="enum"
   required="false"
   description="MCPContentFilterFailurePolicyFail causes the tool call to fail with a<br />JSON-RPC error when the filter service cannot be consulted. Use this<br />when serving unscanned content is worse than failing the call.<br />"
+/>
+#### MCPContentFilterMode
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilter](#mcpcontentfilter)
+
+MCPContentFilterMode selects between enforcement and shadow evaluation.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="Enforce"
+  type="enum"
+  required="false"
+  description="MCPContentFilterModeEnforce applies the filter's verdict to the<br />client-visible response: on redact the rewritten body is forwarded,<br />on reject a JSON-RPC error is returned. This is the default.<br />"
+/><ApiField
+  name="Shadow"
+  type="enum"
+  required="false"
+  description="MCPContentFilterModeShadow invokes the filter and records the<br />verdict (X-Content-Filter-Status header, mcp_filter_decisions_total<br />counter with action=shadow_would_*, redaction audit events) but<br />forwards the ORIGINAL body to the client. Use Shadow mode for<br />pre-production evaluation: operators can measure what WOULD be<br />redacted or rejected on real traffic before committing to<br />enforcement. Shadow mode never surfaces filter errors as<br />client-visible failures — a would-be reject on a fail-closed<br />policy still forwards the original body, and fail-open<br />behaviour is indistinguishable from a successful would-be pass.<br />"
 />
 #### MCPContentFilterScope
 

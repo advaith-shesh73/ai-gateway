@@ -209,6 +209,68 @@ type MCPContentFilter struct {
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+
+	// Mode selects between Enforce (default) and Shadow. In Shadow mode
+	// the gateway still invokes the filter service (or in-process
+	// dispatcher), records the would-be verdict via
+	// X-Content-Filter-Status and mcp_filter_decisions_total, and emits
+	// redaction audit events, but always forwards the ORIGINAL body to
+	// the client (and backend on Request scope). Use Shadow during
+	// pre-production rollout to measure false-positive and
+	// false-negative rates on real traffic without impacting users.
+	// Operators flip back to Enforce to activate actual enforcement
+	// without a gateway restart.
+	//
+	// Defaults to "Enforce".
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	Mode *MCPContentFilterMode `json:"mode,omitempty"`
+
+	// Enabled toggles the filter for this backend without removing the
+	// configuration. When set to false the gateway forwards the tool
+	// call as if no content filter were configured for this backend and
+	// reports X-Content-Filter-Status: disabled on the response.
+	// Preserving the rest of the configuration lets operators
+	// re-enable the filter (possibly with adjusted Mode or
+	// FailurePolicy) via a single CRD update, without re-entering
+	// URL, scopes, timeout, or headers.
+	//
+	// Defaults to true. Use the process-wide kill switch
+	// (MCPContentFilterPolicy.GlobalDisable, distributed via the
+	// policy ConfigMap) to disable every filter in one step during
+	// an incident.
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// ShadowSampleRatePermille bounds the fraction of invocations
+	// actually evaluated when Mode is Shadow. It is expressed in
+	// permille (parts per thousand, 0..1000) so operators can set
+	// 0.1% granularity on high-traffic backends without switching
+	// to floating point. A value of 1000 means every shadow-mode
+	// invocation is evaluated (default, preserves backward compat).
+	// A value of 0 means the filter is never invoked and every
+	// shadow-mode call records action=shadow_sampled_out.
+	//
+	// Sampling happens BEFORE the filter service is contacted, so
+	// values < 1000 provide a hard cost and latency budget: an
+	// operator running shadow mode against an expensive LLM-based
+	// filter can cap traffic at e.g. 10 permille (1 %) while still
+	// producing a statistically meaningful sample for
+	// false-positive / false-negative dashboards.
+	//
+	// Ignored when Mode is Enforce (enforcement always evaluates
+	// every call — sampling enforcement would leak content).
+	//
+	// Defaults to 1000.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	ShadowSampleRatePermille *int32 `json:"shadowSampleRatePermille,omitempty"`
 }
 
 // MCPContentFilterScope selects a phase of the tools/call lifecycle.
@@ -240,6 +302,29 @@ const (
 	// JSON-RPC error when the filter service cannot be consulted. Use this
 	// when serving unscanned content is worse than failing the call.
 	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
+
+// MCPContentFilterMode selects between enforcement and shadow evaluation.
+//
+// +kubebuilder:validation:Enum=Enforce;Shadow
+type MCPContentFilterMode string
+
+const (
+	// MCPContentFilterModeEnforce applies the filter's verdict to the
+	// client-visible response: on redact the rewritten body is forwarded,
+	// on reject a JSON-RPC error is returned. This is the default.
+	MCPContentFilterModeEnforce MCPContentFilterMode = "Enforce"
+	// MCPContentFilterModeShadow invokes the filter and records the
+	// verdict (X-Content-Filter-Status header, mcp_filter_decisions_total
+	// counter with action=shadow_would_*, redaction audit events) but
+	// forwards the ORIGINAL body to the client. Use Shadow mode for
+	// pre-production evaluation: operators can measure what WOULD be
+	// redacted or rejected on real traffic before committing to
+	// enforcement. Shadow mode never surfaces filter errors as
+	// client-visible failures — a would-be reject on a fail-closed
+	// policy still forwards the original body, and fail-open
+	// behaviour is indistinguishable from a successful would-be pass.
+	MCPContentFilterModeShadow MCPContentFilterMode = "Shadow"
 )
 
 // MCPToolFilter filters tools using include and exclude patterns with exact matches or regular expressions.

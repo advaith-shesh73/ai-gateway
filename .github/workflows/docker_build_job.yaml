@@ -16,6 +16,8 @@ jobs:
             cmd_path_prefix: cmd
           - command_name: "aigw"
             cmd_path_prefix: cmd
+          - command_name: "content-filter"
+            cmd_path_prefix: cmd
           - command_name: "testupstream"
             cmd_path_prefix: tests/internal/testupstreamlib
     steps:

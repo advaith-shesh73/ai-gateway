@@ -74,6 +74,28 @@ type MCPContentFilter struct {
 	// ForwardHeaders is the case-insensitive list of client HTTP headers
 	// forwarded into each filter invocation.
 	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+
+	// Mode selects enforcement vs. shadow evaluation. An empty value
+	// is treated as Enforce (the default) by the runtime. See
+	// [aigv1a1.MCPContentFilterMode] for the full contract.
+	Mode MCPContentFilterMode `json:"mode,omitempty"`
+
+	// Enabled toggles the filter for this backend without removing the
+	// configuration. A nil pointer is treated as enabled=true by the
+	// runtime (for backwards compatibility with configs that do not
+	// carry the field). Setting the pointer to false short-circuits
+	// every Request/Response-scope invocation for this backend and
+	// reports X-Content-Filter-Status: disabled. Global overrides
+	// live on MCPContentFilterPolicy.GlobalDisable.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// ShadowSampleRatePermille bounds shadow-mode invocations in
+	// permille (parts per thousand, 0..1000). Zero values are
+	// treated as 1000 (fully sampled) by the runtime so existing
+	// configs that do not carry the field keep their semantics.
+	// Values outside the range are clamped at validation time.
+	// Ignored when Mode is not Shadow.
+	ShadowSampleRatePermille int32 `json:"shadowSampleRatePermille,omitempty"`
 }
 
 // MCPContentFilterScope is the runtime mirror of
@@ -98,6 +120,20 @@ const (
 	// MCPContentFilterFailurePolicyFail aborts the tool call when the filter
 	// cannot be consulted.
 	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
+
+// MCPContentFilterMode is the runtime mirror of
+// [aigv1a1.MCPContentFilterMode].
+type MCPContentFilterMode string
+
+const (
+	// MCPContentFilterModeEnforce applies the filter verdict to the
+	// client-visible response. Default when the field is empty.
+	MCPContentFilterModeEnforce MCPContentFilterMode = "Enforce"
+	// MCPContentFilterModeShadow runs the filter pipeline but always
+	// forwards the ORIGINAL body. See [aigv1a1.MCPContentFilterMode]
+	// for the full contract.
+	MCPContentFilterModeShadow MCPContentFilterMode = "Shadow"
 )
 
 // MCPBackendName is the name of the MCP backend.

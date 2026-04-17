@@ -412,13 +412,79 @@ spec:
           - x-tenant-id
 ```
 
-| Field            | Description                                                                                                                                                                                                                       |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `url`            | HTTP endpoint of the filter service. Must use `http://` or `https://`.                                                                                                                                                            |
-| `scopes`         | One or both of `Request` and `Response`. The filter is only invoked at the scopes listed here.                                                                                                                                    |
-| `timeoutSeconds` | Per-invocation timeout (default `10`, max `120`).                                                                                                                                                                                 |
-| `failurePolicy`  | `PassThrough` (default) forwards the unmodified payload when the filter is unreachable or errors. `Fail` aborts the tool call with a JSON-RPC error. Reject responses from the filter always abort the call regardless of policy. |
-| `forwardHeaders` | Optional list of client-request header names that are copied into the filter request (case-insensitive, at most 16 entries).                                                                                                      |
+| Field                      | Description                                                                                                                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`                      | HTTP endpoint of the filter service. Must use `http://` or `https://`.                                                                                                                                                            |
+| `scopes`                   | One or both of `Request` and `Response`. The filter is only invoked at the scopes listed here.                                                                                                                                    |
+| `timeoutSeconds`           | Per-invocation timeout (default `10`, max `120`).                                                                                                                                                                                 |
+| `failurePolicy`            | `PassThrough` (default) forwards the unmodified payload when the filter is unreachable or errors. `Fail` aborts the tool call with a JSON-RPC error. Reject responses from the filter always abort the call regardless of policy. |
+| `forwardHeaders`           | Optional list of client-request header names that are copied into the filter request (case-insensitive, at most 16 entries).                                                                                                      |
+| `mode`                     | `Enforce` (default) applies the filter verdict. `Shadow` invokes the filter but always forwards the ORIGINAL body; verdicts are recorded via `X-Content-Filter-Status`, `mcp_filter_decisions_total`, and redaction audit events. |
+| `enabled`                  | Per-backend kill switch (default `true`). Setting `false` skips the filter entirely and emits `X-Content-Filter-Status: disabled`. Configuration is preserved for easy re-enable.                                                 |
+| `shadowSampleRatePermille` | Sampling budget in permille (0..1000, default `1000`). Applies only when `mode: Shadow`. Values below 1000 cap LLM cost; invocations that are not sampled record `action=shadow_sampled_out` and skip the filter call.            |
+
+#### Safe rollout: shadow mode, kill switches, sampling
+
+The filter supports a full progressive-delivery lifecycle without any
+external rollout tooling:
+
+1. **Shadow mode** (`mode: Shadow`). The filter is invoked on every
+   eligible call but the gateway always forwards the ORIGINAL body to
+   the client. The verdict is recorded as
+   `action=shadow_would_{pass,redact,reject,fail}` on the
+   `mcp_filter_decisions_total` counter and on the
+   `X-Content-Filter-Status` header. Use shadow mode to measure
+   false-positive / false-negative rates on real traffic before
+   committing to enforcement.
+
+2. **Sample rate** (`shadowSampleRatePermille`). Bounds how many
+   shadow-mode calls are actually sent to the filter. Expressed in
+   permille (parts per thousand) so 0.1% granularity is cheap:
+   `shadowSampleRatePermille: 100` means 10% of eligible calls hit
+   the filter, the remaining 90% short-circuit with
+   `action=shadow_sampled_out`. Ignored in enforce mode; enforcing a
+   sampled fraction would leak content intermittently.
+
+3. **Per-backend kill switch** (`enabled: false`). Stops filtering on
+   a single backend without editing the rest of the route. Config is
+   preserved so re-enabling is one `kubectl edit` away.
+
+4. **Cluster-wide kill switch** (`MCPContentFilterPolicy.globalDisable`).
+   Lives in the process-wide ConfigMap (see
+   `internal/filterapi/mcp_content_filter_policy.go`). Flipping it to
+   `true` disables every filter on every backend in the cluster —
+   the intended knob for incident response.
+
+All four knobs hot-reload via the `AtomicDispatcher` pointer swap;
+changing any of them does NOT require a gateway pod restart.
+
+```yaml
+# Shadow rollout at 10% sampling
+- name: supportgpt
+  contentFilter:
+    url: http://content-filter.mcp.svc.cluster.local:8080/filter
+    scopes: [Response]
+    mode: Shadow
+    shadowSampleRatePermille: 100
+    enabled: true
+```
+
+```yaml
+# Production enforcement with fail-closed (unscanned == no response)
+- name: supportgpt
+  contentFilter:
+    url: http://content-filter.mcp.svc.cluster.local:8080/filter
+    scopes: [Response]
+    mode: Enforce
+    failurePolicy: Fail
+    enabled: true
+```
+
+See [`examples/content-filter/`](https://github.com/envoyproxy/ai-gateway/tree/main/examples/content-filter)
+for a complete deployment of the reference `content-filter` service
+(including the LLM-powered evaluation-mode redactor ported from
+panacea-agent PR 95) together with example routes in both shadow and
+enforce modes.
 
 #### Wire Protocol
 

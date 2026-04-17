@@ -1,0 +1,256 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# This manifest deploys the content-filter sidecar service that ports
+# panacea-agent PR 95 (LLM-powered semantic redactor for MCP tool output
+# during evaluation runs). It is a reference example; copy/paste into
+# your own GitOps repo, set your registry, and adjust resource limits
+# to fit your traffic volume.
+#
+# The service is stateless, exposes a single POST /filter endpoint on
+# port 9093, and reads its configuration from the ConfigMap mounted at
+# /etc/content-filter/config.json. Credential material is loaded from
+# an environment variable populated by a Kubernetes Secret (preferred)
+# OR from a file whose path is set in the ConfigMap (for sites that
+# refuse to put secrets in env vars).
+#
+# The MCPGatewayRoute that wires this service into traffic lives in
+# gateway-route.yaml — apply this file first so the Service has DNS
+# by the time the gateway picks up the route.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: content-filter
+---
+###############################################################################
+# ConfigMap: non-secret runtime tunables for the content-filter service.
+#
+# In production, generate this from your source-of-truth config system
+# (Kustomize overlay, Helm values, etc.) rather than editing it in
+# place — every field here is a deployment decision.
+###############################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: content-filter-config
+  namespace: content-filter
+  labels:
+    app.kubernetes.io/name: content-filter
+    app.kubernetes.io/part-of: ai-gateway
+data:
+  config.json: |
+    {
+      "addr": ":9093",
+      "policy": "eval",
+      "timeoutSeconds": 65,
+      "eval": {
+        "endpoint": "https://hkn12.ai.nutanix.com/enterpriseai/v1/chat/completions",
+        "model": "hack-reason",
+        "apiKeyEnv": "LLM_API_KEY",
+        "timeoutSeconds": 60,
+        "temperature": 0,
+        "insecureSkipTLSVerify": true,
+        "filteredTools": [
+          "mcp_atlassian_getAccessibleAtlassianResources",
+          "mcp_atlassian_getJiraIssue",
+          "mcp_atlassian_searchJiraIssuesUsingJql",
+          "mcp_atlassian_getJiraIssueRemoteIssueLinks",
+          "mcp_atlassian_getVisibleJiraProjects",
+          "mcp_atlassian_getJiraProjectIssueTypesMetadata",
+          "mcp_atlassian_searchConfluenceUsingCql",
+          "mcp_atlassian_getConfluencePage",
+          "mcp_atlassian_getPagesInConfluenceSpace",
+          "mcp_atlassian_getConfluencePageAncestors",
+          "mcp_atlassian_getConfluencePageDescendants",
+          "mcp_atlassian_getConfluencePageFooterComments",
+          "mcp_atlassian_getConfluencePageInlineComments",
+          "mcp_atlassian_getConfluenceSpaces"
+        ],
+        "evalTicketID": "",
+        "ticketHeader": "X-Eval-Ticket-Id"
+      }
+    }
+---
+###############################################################################
+# Secret: LLM bearer token.
+#
+# NEVER commit real secrets to git. This manifest only exists to show
+# the expected key layout. Populate it via your secret-management tool
+# (Sealed Secrets, External Secrets Operator, Vault, etc.).
+#
+# The content-filter service reads LLM_API_KEY from env (see the
+# Deployment below). If your site requires a file-based mount instead,
+# set `apiKeyEnv: ""` and `apiKeyFile: "/etc/content-filter/secrets/api-key"`
+# in the ConfigMap, and mount this Secret at that path.
+###############################################################################
+apiVersion: v1
+kind: Secret
+metadata:
+  name: content-filter-llm-credentials
+  namespace: content-filter
+  labels:
+    app.kubernetes.io/name: content-filter
+    app.kubernetes.io/part-of: ai-gateway
+type: Opaque
+stringData:
+  # Populate with your bearer token. Leaving it empty triggers the
+  # safe-redaction fallback (every filtered tool output is replaced
+  # with "[ENTIRE OUTPUT REDACTED - FILTER UNAVAILABLE]") — useful for
+  # integration tests where you do NOT want to spend LLM credits.
+  api-key: ""
+---
+###############################################################################
+# ServiceAccount: the content-filter pod runs as a dedicated SA so
+# cluster-admins can grant/revoke cluster access in one place.
+###############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: content-filter
+  namespace: content-filter
+  labels:
+    app.kubernetes.io/name: content-filter
+    app.kubernetes.io/part-of: ai-gateway
+---
+###############################################################################
+# Deployment: the content-filter service itself.
+#
+# Sizing notes:
+#   - Each replica serves ~50 concurrent LLM calls (the httpLLMClient
+#     keeps up to 50 connections in its Transport pool). Size the
+#     replica count by `peak filtered tool calls / 50`, rounded up.
+#   - CPU is cheap — the service does near-zero work outside of HTTP
+#     marshalling. 250m CPU is typical; 500m is a safe upper bound.
+#   - Memory tracks the in-flight LLM response buffer (2 MiB cap per
+#     call). 128 MiB is comfortable for 50 concurrent calls.
+#
+# Rollout notes:
+#   - Deployment uses RollingUpdate with maxSurge=1 / maxUnavailable=0
+#     so existing in-flight filter calls always have somewhere to land
+#     during a config change.
+#   - Pod graceful-shutdown is 30s (matches cmd/content-filter/main.go).
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: content-filter
+  namespace: content-filter
+  labels:
+    app.kubernetes.io/name: content-filter
+    app.kubernetes.io/part-of: ai-gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: content-filter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: content-filter
+        app.kubernetes.io/part-of: ai-gateway
+    spec:
+      serviceAccountName: content-filter
+      terminationGracePeriodSeconds: 35
+      # Non-root execution and a read-only root fs are cheap hardening
+      # wins for a service that only needs a config file on disk.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: content-filter
+          # Update to your registry. The repo convention is
+          # `make docker-build.content-filter ENABLE_MULTI_PLATFORMS=true
+          #   DOCKER_BUILD_ARGS="--push" TAG=v1.0.0`.
+          image: docker.io/envoyproxy/ai-gateway-content-filter:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/content-filter/config.json
+            - --log-level=info
+          ports:
+            - name: http
+              containerPort: 9093
+              protocol: TCP
+          env:
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: content-filter-llm-credentials
+                  key: api-key
+                  optional: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/content-filter
+              readOnly: true
+          # Readiness gates traffic to the pod once it can accept
+          # requests. The service DOES NOT probe the LLM from
+          # /healthz because a transient LLM outage is NOT a reason
+          # to take the pod out of rotation during shadow rollout —
+          # safe-redaction kicks in instead.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: config
+          configMap:
+            name: content-filter-config
+---
+###############################################################################
+# Service: stable in-cluster DNS for the content-filter. The gateway's
+# MCPContentFilter `url` field points at this name.
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: content-filter
+  namespace: content-filter
+  labels:
+    app.kubernetes.io/name: content-filter
+    app.kubernetes.io/part-of: ai-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: content-filter
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

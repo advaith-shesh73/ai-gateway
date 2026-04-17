@@ -76,6 +76,12 @@ const (
 	// FilterStatusOff means no filter was configured for the
 	// current scope on this (route, backend).
 	FilterStatusOff FilterStatus = "off"
+	// FilterStatusDisabled means the filter is configured but the
+	// kill switch is engaged — either the per-backend Enabled flag
+	// is false or the process-wide GlobalDisable is set. The
+	// original body is forwarded unchanged and no upstream filter
+	// call is issued.
+	FilterStatusDisabled FilterStatus = "disabled"
 )
 
 // filterMetrics is the optional process-wide Prometheus observer that
@@ -148,6 +154,71 @@ type contentFilter struct {
 	// in-process dispatch. Shared across all goroutines; safe for
 	// concurrent use. See contentfilter_inprocess.go for the adapter.
 	dispatcher *Dispatcher
+	// mode is the compiled enforcement mode. Empty is treated as
+	// MCPContentFilterModeEnforce at invocation time so legacy
+	// configs keep their behavior.
+	mode filterapi.MCPContentFilterMode
+	// enabled is the compiled kill switch. nil is treated as true
+	// so a config that does not carry the field stays live. See
+	// [filterapi.MCPContentFilter.Enabled] for the full contract.
+	enabled *bool
+	// shadowSampleRatePermille is the compiled sampling budget in
+	// parts per thousand (0..1000). A value of 0 is treated as 1000
+	// (fully sampled) at invocation time so configs that do not
+	// carry the field keep their behavior. Ignored when mode is
+	// not Shadow.
+	shadowSampleRatePermille int32
+	// policy is an optional reference to the process-wide policy
+	// snapshot. When non-nil, the gates consult GlobalDisable on
+	// every invocation so a single ConfigMap edit can stop every
+	// filter in the cluster. The pointer is never mutated after
+	// publication; hot-reloading rebuilds the whole contentFilter.
+	policy *filterapi.MCPContentFilterPolicy
+}
+
+// effectiveMode returns the filter's compiled mode, substituting
+// MCPContentFilterModeEnforce for the empty string so callers do not
+// have to spell the default out. Nil receivers return Enforce.
+func (cf *contentFilter) effectiveMode() filterapi.MCPContentFilterMode {
+	if cf == nil || cf.mode == "" {
+		return filterapi.MCPContentFilterModeEnforce
+	}
+	return cf.mode
+}
+
+// isDisabled reports whether the kill switches are engaged. Returns
+// true when GlobalDisable is set on the attached policy OR when the
+// per-backend Enabled pointer is explicitly false. A nil pointer or
+// a nil filter is treated as enabled (false).
+func (cf *contentFilter) isDisabled() bool {
+	if cf == nil {
+		return false
+	}
+	if cf.policy != nil && cf.policy.GlobalDisable {
+		return true
+	}
+	if cf.enabled != nil && !*cf.enabled {
+		return true
+	}
+	return false
+}
+
+// shadowSampleRateBounded returns the effective shadow sample rate,
+// clamped into the documented [0, 1000] range. Zero stored values are
+// treated as 1000 so back-compat configs retain their existing
+// behavior (fully sampled). Values above 1000 clamp to 1000.
+func (cf *contentFilter) shadowSampleRateBounded() int32 {
+	if cf == nil {
+		return 1000
+	}
+	r := cf.shadowSampleRatePermille
+	if r <= 0 {
+		return 1000
+	}
+	if r > 1000 {
+		return 1000
+	}
+	return r
 }
 
 // WithDispatcher returns cf with the given dispatcher attached. Returns
@@ -213,6 +284,24 @@ func compileContentFilter(cf *filterapi.MCPContentFilter, routeName filterapi.MC
 	default:
 		return nil, fmt.Errorf("content filter for backend %q in route %q has unknown failure policy %q", backendName, routeName, cf.FailurePolicy)
 	}
+
+	switch cf.Mode {
+	case "", filterapi.MCPContentFilterModeEnforce:
+		out.mode = filterapi.MCPContentFilterModeEnforce
+	case filterapi.MCPContentFilterModeShadow:
+		out.mode = filterapi.MCPContentFilterModeShadow
+	default:
+		return nil, fmt.Errorf("content filter for backend %q in route %q has unknown mode %q", backendName, routeName, cf.Mode)
+	}
+
+	if cf.Enabled != nil {
+		b := *cf.Enabled
+		out.enabled = &b
+	}
+	if cf.ShadowSampleRatePermille < 0 || cf.ShadowSampleRatePermille > 1000 {
+		return nil, fmt.Errorf("content filter for backend %q in route %q has shadowSampleRatePermille %d out of range [0,1000]", backendName, routeName, cf.ShadowSampleRatePermille)
+	}
+	out.shadowSampleRatePermille = cf.ShadowSampleRatePermille
 
 	if len(cf.ForwardHeaders) > 0 {
 		seen := make(map[string]struct{}, len(cf.ForwardHeaders))
@@ -433,6 +522,25 @@ func applyContentFilterOnRequestWithStatus(
 	if cf == nil || !cf.invokeOnRequest {
 		return req, FilterStatusOff, nil
 	}
+	// Gate 1: kill switch. When GlobalDisable (process-wide) or
+	// Enabled=false (per-backend) is set we forward the original
+	// body without contacting the filter and emit status=disabled
+	// so dashboards can distinguish "off" (no filter configured)
+	// from "disabled" (configured but suppressed).
+	if cf.isDisabled() {
+		emitShadowDecision(routeName, backendName, ScopeRequest, contentFilterActionDisabled)
+		emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionDisabled, "", 0, 0, 0)
+		return req, FilterStatusDisabled, nil
+	}
+	// Gate 2: shadow-mode sampling. When the per-backend
+	// ShadowSampleRatePermille excludes this call we skip the
+	// upstream filter entirely and record action=shadow_sampled_out
+	// so operators can size budgets against real traffic volumes.
+	if cf.effectiveMode() == filterapi.MCPContentFilterModeShadow && !cf.sampleThisShadowCall() {
+		emitShadowDecision(routeName, backendName, ScopeRequest, contentFilterActionShadowSampledOut)
+		emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionShadowSampledOut, "", 0, 0, 0)
+		return req, FilterStatusPass, nil
+	}
 	body, err := jsonrpc.EncodeMessage(req)
 	if err != nil {
 		return nil, FilterStatusUnavailable, fmt.Errorf("encode JSON-RPC request for content filter: %w", err)
@@ -443,6 +551,7 @@ func applyContentFilterOnRequestWithStatus(
 		rejected  bool
 		reason    string
 		invokeErr error
+		started   = time.Now()
 	)
 	// Prefer in-process dispatch when a dispatcher is wired up; fall
 	// back to the HTTP sidecar path otherwise. The two branches are
@@ -454,6 +563,24 @@ func applyContentFilterOnRequestWithStatus(
 	} else {
 		newBody, rejected, reason, invokeErr = cf.invoke(ctx, client, contentFilterScopeRequest,
 			routeName, backendName, req.Method, tool, headers, body)
+	}
+	elapsed := time.Since(started)
+
+	// Shadow-mode branch: never apply the verdict, always forward
+	// the original body. We still record WHAT the filter WOULD
+	// have done so operators can A/B against enforce-mode traffic.
+	if cf.effectiveMode() == filterapi.MCPContentFilterModeShadow {
+		if invokeErr != nil {
+			l.warn("content filter request invocation failed in shadow mode",
+				"route", routeName, "backend", backendName, "tool", tool, "err", invokeErr.Error())
+			emitShadowDecision(routeName, backendName, ScopeRequest, contentFilterActionShadowWouldFail)
+			emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionShadowWouldFail, invokeErr.Error(), len(body), 0, elapsed)
+			return req, FilterStatusPass, nil
+		}
+		verdict := shadowBodyVerdict(body, newBody, rejected)
+		emitShadowDecision(routeName, backendName, ScopeRequest, verdict)
+		emitShadowAudit(ctx, routeName, backendName, tool, verdict, reason, len(body), len(newBody), elapsed)
+		return req, FilterStatusPass, nil
 	}
 
 	if invokeErr != nil {
@@ -531,6 +658,19 @@ func applyContentFilterOnResponseWithStatus(
 	if cf == nil || !cf.invokeOnResponse {
 		return resp, FilterStatusOff, nil
 	}
+	// Gate 1: kill switch — identical semantics to the Request path.
+	if cf.isDisabled() {
+		emitShadowDecision(routeName, backendName, ScopeResponse, contentFilterActionDisabled)
+		emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionDisabled, "", 0, 0, 0)
+		return resp, FilterStatusDisabled, nil
+	}
+	// Gate 2: shadow-mode sampling — skipped calls emit
+	// action=shadow_sampled_out and forward the original body.
+	if cf.effectiveMode() == filterapi.MCPContentFilterModeShadow && !cf.sampleThisShadowCall() {
+		emitShadowDecision(routeName, backendName, ScopeResponse, contentFilterActionShadowSampledOut)
+		emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionShadowSampledOut, "", 0, 0, 0)
+		return resp, FilterStatusPass, nil
+	}
 	body, err := jsonrpc.EncodeMessage(resp)
 	if err != nil {
 		return nil, FilterStatusUnavailable, fmt.Errorf("encode JSON-RPC response for content filter: %w", err)
@@ -545,6 +685,7 @@ func applyContentFilterOnResponseWithStatus(
 		rejected  bool
 		reason    string
 		invokeErr error
+		started   = time.Now()
 	)
 	// Same branch as the request path: dispatcher wins when present,
 	// HTTP sidecar is the fallback.
@@ -554,6 +695,25 @@ func applyContentFilterOnResponseWithStatus(
 	} else {
 		newBody, rejected, reason, invokeErr = cf.invoke(ctx, client, contentFilterScopeResponse,
 			routeName, backendName, method, tool, headers, body)
+	}
+	elapsed := time.Since(started)
+
+	// Shadow-mode branch: forward the original response, record
+	// what WOULD have happened. Shadow is never fail-closed: we do
+	// not want filter outages during rollout to start rejecting
+	// traffic.
+	if cf.effectiveMode() == filterapi.MCPContentFilterModeShadow {
+		if invokeErr != nil {
+			l.warn("content filter response invocation failed in shadow mode",
+				"route", routeName, "backend", backendName, "tool", tool, "err", invokeErr.Error())
+			emitShadowDecision(routeName, backendName, ScopeResponse, contentFilterActionShadowWouldFail)
+			emitShadowAudit(ctx, routeName, backendName, tool, contentFilterActionShadowWouldFail, invokeErr.Error(), len(body), 0, elapsed)
+			return resp, FilterStatusPass, nil
+		}
+		verdict := shadowBodyVerdict(body, newBody, rejected)
+		emitShadowDecision(routeName, backendName, ScopeResponse, verdict)
+		emitShadowAudit(ctx, routeName, backendName, tool, verdict, reason, len(body), len(newBody), elapsed)
+		return resp, FilterStatusPass, nil
 	}
 
 	if invokeErr != nil {

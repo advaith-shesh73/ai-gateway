@@ -51,6 +51,19 @@ type MCPContentFilterPolicy struct {
 	// When true, Validate() will refuse any policy whose PII.FailClosed is
 	// false; the gateway must crash rather than silently ship fail-open.
 	RequirePIIFailClosed bool `json:"requirePIIFailClosed"`
+
+	// GlobalDisable is the process-wide kill switch. When true, every
+	// MCPContentFilter attached to any backend is short-circuited:
+	// the gateway emits X-Content-Filter-Status: disabled, records
+	// mcp_filter_status_total with status=disabled, and forwards the
+	// original body unchanged. Intended for incident response where
+	// operators need one lever to disable filtering for the whole
+	// cluster without editing every MCPGatewayRoute. The ConfigMap
+	// this ships in is typically reloaded hot (no gateway restart).
+	//
+	// Defaults to false so a missing or empty ConfigMap leaves
+	// filtering fully active.
+	GlobalDisable bool `json:"globalDisable,omitempty"`
 }
 
 // PIIPolicy mirrors the Python AppConfig.pii_* fields and the new Go-only

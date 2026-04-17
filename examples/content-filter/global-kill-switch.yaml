@@ -1,0 +1,91 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# Cluster-wide kill switch: MCPContentFilterPolicy ConfigMap.
+#
+# The gateway reads this ConfigMap at startup (and hot-reloads it via
+# the Envoy AI Gateway controller). Flipping `globalDisable: true`
+# short-circuits EVERY MCPContentFilter attached to any backend:
+#
+#   - No filter URL is contacted (request OR response scope).
+#   - X-Content-Filter-Status: disabled is set on the response.
+#   - mcp_filter_status_total{status="disabled"} increments.
+#   - The ORIGINAL body is forwarded unchanged.
+#
+# The knob is intended for incident response — one lever to back out
+# of a filter-related regression (LLM outage, bad policy deploy,
+# unexpected latency spike) without editing every MCPRoute in the
+# fleet. Once the root cause is fixed, flip it back to `false` and
+# the fleet resumes filtering on the next reconcile.
+#
+# Complementary kill switches:
+#   - Per-backend: `enabled: false` on the MCPContentFilter spec.
+#   - Per-environment: shadow mode with `shadowSampleRatePermille: 0`
+#     (valid in shadow mode only; enforce ignores the sampling knob).
+#
+# ConfigMap shape:
+#   key  = "policy.json"
+#   value = JSON-encoded filterapi.MCPContentFilterPolicy (struct in
+#           internal/filterapi/mcp_content_filter_policy.go)
+#
+# Only `globalDisable` is operationally meaningful for THIS example;
+# the rest of the policy governs the in-process content filter (PII,
+# Jira, etc.) and is left at safe defaults. A production deployment
+# running both the in-process filter AND the out-of-process
+# content-filter service would populate PII/Jira/Cache/Breaker
+# sections here too.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-content-filter-policy
+  # Namespace must match whatever the gateway is configured to watch
+  # via --content-filter-policy-configmap=<namespace>/<name>. By
+  # convention this lives in the same namespace as the gateway pod.
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/name: mcp-content-filter-policy
+    app.kubernetes.io/part-of: ai-gateway
+data:
+  policy.json: |
+    {
+      "globalDisable": false,
+      "requirePIIFailClosed": false,
+      "pii": {
+        "url": "http://pii-service.pii.svc.cluster.local:8081/anonymize",
+        "timeoutSeconds": 60,
+        "failClosed": false,
+        "maxCharsPerRequest": 40000,
+        "maxParallelChunks": 4,
+        "maxParallelParts": 4,
+        "httpMaxConnections": 100,
+        "httpMaxIdle": 20
+      },
+      "cache": {
+        "enabled": true,
+        "maxEntries": 2048,
+        "ttlSeconds": 900
+      },
+      "breaker": {
+        "enabled": true,
+        "failureThreshold": 10,
+        "resetSeconds": 120
+      },
+      "backends": {
+        "enableSupportGPT": true,
+        "enableNuRAG": true,
+        "enableGlean": true,
+        "enableJira": false,
+        "enableDefaultPII": true
+      },
+      "evalHeader": {
+        "name": "x-eval-exclude-ticket-id",
+        "strict": false
+      },
+      "wire": {
+        "maxBodyBytes": 2097152
+      }
+    }

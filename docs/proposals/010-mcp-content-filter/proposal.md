@@ -60,9 +60,11 @@ in-process runtime inside the MCP proxy.
 - **Stream-level filtering of notifications or server-to-client requests.**
   The filter operates on `tools/call` bodies only. Long-lived SSE streams
   from the aggregated notification channel are out of scope for v1.
-- **Control-plane orchestration.** Shadow mode, canary rollouts, and kill
-  switches are all explicitly deferred to the platform layer — see
-  [Future Work](#future-work).
+- **Embedding policy-specific domain knowledge in the gateway.** Bespoke
+  policies like evaluation-mode semantic redaction live in the
+  out-of-process `content-filter` service (see the
+  [Out-of-Process Policy Service](#out-of-process-policy-service) section
+  below).
 
 ## Quick Overview
 
@@ -294,6 +296,196 @@ metric store by cycling labels.
   `internal/logsafe`, which strips bodies and replaces them with size +
   content-type summaries.
 
+## Shadow Mode, Kill Switches, Sampling
+
+The original proposal punted control-plane orchestration (shadow mode,
+canary, kill switches) to future work. In practice every rollout we
+run has had to build at least two of these primitives ad hoc, so v1.1
+of this proposal adds them to the surface as first-class knobs. The
+goal is that an operator can deploy filtering changes by flipping
+fields on a CRD or a ConfigMap — never by recompiling the gateway,
+never by editing a route to disable filtering during an incident.
+
+### Shadow mode
+
+`MCPContentFilter.Mode` (enum `Enforce` | `Shadow`, default
+`Enforce`) controls whether the filter's verdict is applied:
+
+- **`Enforce`**: legacy behaviour. `redact` swaps the body, `reject`
+  returns a JSON-RPC error.
+- **`Shadow`**: the filter is invoked normally, but the gateway
+  **always** forwards the ORIGINAL body. The verdict is recorded via:
+  1. `X-Content-Filter-Status: shadow_would_{pass,redact,reject,fail}`
+     on the response.
+  2. `mcp_filter_decisions_total{action="shadow_would_*"}` counter
+     tallies.
+  3. A `RedactionAuditEvent` with `Outcome` populated so shadow
+     transcripts can be diff'd against live traffic.
+
+Flip from shadow to enforce without a gateway restart by changing
+`mode: Shadow` to `mode: Enforce` in the `MCPContentFilter` spec;
+the controller translates and the dispatcher hot-swaps.
+
+### Per-backend kill switch
+
+`MCPContentFilter.Enabled` (bool, default `true`) is a per-backend
+kill switch. When `false`, the gateway emits
+`X-Content-Filter-Status: disabled`, increments
+`mcp_filter_status_total{status="disabled"}`, and forwards the
+original body. All other fields on the spec are preserved so the
+operator can re-enable with a single `kubectl edit`.
+
+### Cluster-wide kill switch
+
+`MCPContentFilterPolicy.GlobalDisable` (bool, default `false`) is
+the cluster-scoped kill switch. It lives in the same ConfigMap that
+configures the in-process PII filter (see `internal/filterapi/
+mcp_content_filter_policy.go`) and, when flipped to `true`,
+short-circuits **every** `MCPContentFilter` attached to any backend.
+The intended use is incident response: one lever to back out a
+filter-related regression (LLM outage, bad policy deploy, unexpected
+latency spike) without touching individual `MCPRoute`s.
+
+Precedence (checked in order):
+
+1. `GlobalDisable = true` → `disabled`, original body.
+2. `Enabled = false` → `disabled`, original body.
+3. `Mode = Shadow` → sampling gate (below), then filter call, then
+   original body.
+4. `Mode = Enforce` → filter call with verdict applied.
+
+### Sampling budget
+
+`MCPContentFilter.ShadowSampleRatePermille` (int32, 0..1000,
+default 1000) bounds the fraction of shadow-mode invocations that
+actually hit the filter. It is expressed in permille rather than
+percent so operators can set 0.1 % granularity on high-traffic
+backends without switching to floating point:
+
+- `1000` = every shadow-mode invocation is evaluated (default;
+  preserves backward compatibility).
+- `100` = 10 % sample (typical rollout default).
+- `1` = 0.1 % sample (incident-throttle).
+- `0` = filter is never invoked; every shadow call records
+  `action="shadow_sampled_out"`.
+
+Sampling happens **before** the filter service is contacted, so the
+knob is a hard cost-and-latency budget. An operator running shadow
+mode against an LLM-based filter that costs ~$0.01/call can cap
+traffic at 10 permille (1 %) while still producing a statistically
+meaningful sample for false-positive / false-negative dashboards.
+The sampling decision is cryptographically random (via `crypto/rand`)
+so it is not reproducible — any attempt to game the sample by
+replaying requests would have 1-in-thousands odds of selecting the
+same bucket.
+
+Sampling is **ignored** when `Mode = Enforce`. Sampling enforcement
+would leak content intermittently, defeating the whole point of
+filtering.
+
+### Hot reload
+
+All four knobs above (`Mode`, `Enabled`, `ShadowSampleRatePermille`,
+`GlobalDisable`) are translated into the runtime `contentFilter`
+struct by the controller. A change to any of them triggers
+`AtomicDispatcher` pointer swap (L25), so the next invocation sees
+the new value without a gateway pod restart. Operators can therefore
+drive an entire rollout — shadow at 1 % → shadow at 10 % → shadow at
+100 % → enforce → kill switch → re-enable — without ever
+bouncing the gateway.
+
+## Out-of-Process Policy Service
+
+The `MCPContentFilter` wire contract is agnostic to who implements
+the `/filter` endpoint. We ship a reference implementation — the
+`content-filter` service — that both serves as a template for
+third-party filters and hosts the LLM-based evaluation policy
+(below).
+
+### Repository layout
+
+| Path                                 | Purpose                                                                                |
+| ------------------------------------ | -------------------------------------------------------------------------------------- |
+| `cmd/content-filter/main.go`         | Entrypoint; loads config, wires policy, starts HTTP server, handles graceful shutdown. |
+| `internal/contentfilter/`            | Server runtime (HTTP handlers, config loading, policy interface, passthrough policy).  |
+| `internal/contentfilter/wire/`       | Wire types shared with the gateway (`envelope.go`).                                    |
+| `internal/contentfilter/evalpolicy/` | The evaluation policy — LLM-powered semantic redactor ported from panacea-agent PR 95. |
+| `examples/content-filter/`           | Example k8s manifests: deployment, routes (shadow + enforce), global kill-switch.      |
+
+### Policy interface
+
+A content-filter **Policy** is any type implementing:
+
+```go
+type Policy interface {
+	Filter(ctx context.Context, req *wire.FilterRequest) (*wire.FilterResponse, error)
+	Name() string
+}
+```
+
+The `Server` owns the wire protocol; the `Policy` owns the decision.
+Adding a new policy means implementing two methods and registering
+the constructor in `ServerConfig.BuildPolicy`. The passthrough
+policy (`internal/contentfilter/policy.go`) is the smallest possible
+reference.
+
+### Eval policy — PR 95 port
+
+`internal/contentfilter/evalpolicy/` is the Go port of
+[panacea-agent PR 95](https://github.com/nutanix-core/panacea-agent/pull/95).
+PR 95 was a Cursor hooks `postToolUse` implementation that
+intercepted MCP tool responses before a model saw them. We discard
+the Cursor hooks plumbing and keep the business logic:
+
+1. **Allowlist gate.** Only tools listed in `Config.FilteredTools`
+   are considered; others short-circuit to `ActionPass`.
+2. **MCP envelope unwrap.** Tool output arrives inside a JSON-RPC
+   response whose `result` may be an MCP `{"content": [...]}`
+   wrapper. `parseMCPOutput` extracts the first text item while
+   preserving sibling fields byte-for-byte so `rebuildMCPOutput` can
+   reassemble the exact envelope shape.
+3. **Prompt materialisation.** The system prompt and user prompt
+   template are copied from PR 95 verbatim (`prompts.go`), including
+   the three injection points for the ticket ID.
+4. **LLM call.** `httpLLMClient` POSTs an OpenAI-compatible
+   `/chat/completions` request with temperature 0 (deterministic
+   redaction). `reasoning_content` is consulted as a fallback when
+   `content` is empty, matching PR 95's reasoning-model handling.
+5. **Response sanitisation.** `extractFilteredText` strips
+   `<think>…</think>` blocks and markdown fences so the output is
+   always raw JSON.
+6. **Safe redaction fallback.** If the LLM is unreachable, errors,
+   or returns non-JSON, the entire tool output is replaced with
+   `[ENTIRE OUTPUT REDACTED - FILTER UNAVAILABLE]` wrapped in the
+   appropriate envelope. Over-filtering is always preferred to data
+   leakage.
+
+### Ticket-ID per-call override
+
+PR 95 used a single `EVAL_EXCLUDE_TICKET_ID` env var because each
+Cursor CLI run was a single ticket. The gateway serves many
+concurrent evaluations from one pod, so `Config.EvalTicketID`
+becomes the deployment default and a forwarded HTTP header
+(`X-Eval-Ticket-Id` by default, configurable via
+`Config.TicketHeader`) takes precedence per call. The gateway
+forwards this header to the filter by listing it in the
+`MCPContentFilter.forwardHeaders` field on the `MCPRoute` — no
+gateway-specific plumbing required.
+
+### Credentials
+
+The LLM bearer token is resolved at call time (not startup), so
+rotating the Secret does not require a pod restart. Two sources are
+checked in order:
+
+1. Env var named by `Config.APIKeyEnv` (default `LLM_API_KEY`).
+2. File path in `Config.APIKeyFile` (typically a k8s Secret mount).
+
+A missing credential flows through the safe-redaction fallback,
+exactly like any other LLM failure. Tests rely on this property
+(`TestEvalPolicy_Filter_LLMFailureFallsBackToSafeRedaction`) so the
+behaviour is locked in.
+
 ## Future Work
 
 The implementation intentionally stops at the boundary where external
@@ -301,43 +493,37 @@ infrastructure decisions begin. The following items exist as _in-repo hooks_
 — the code needed to wire them up is ready — but the platform-side
 decisions they depend on are out of scope for this proposal.
 
-### Shadow-mode evaluation
+### Shadow transcript sinks
 
-Run the filter's PII redaction in dry-run mode where outcomes are recorded
-but the pipeline continues with the original (unredacted) text. Operators
-can compare redacted vs. raw transcripts, measure false-positive and
-false-negative rates on real traffic, and build confidence before enabling
-enforcement.
-
-Blocked on:
+Shadow-mode verdicts are currently recorded on metrics + audit log
+only. A production rollout will want to retain the full would-be
+redacted body for diff analysis against the original. This requires:
 
 - an approved retention and access policy for shadow transcripts;
 - a durable sink endpoint — audit-grade DB, object storage, or SIEM;
-- a sampling/budget mechanism so shadow mode is not applied to 100 % of
-  traffic.
+- a schema versioning story so transcripts from today are still
+  readable when the `RedactionAuditEvent` shape evolves.
 
-Hooks already in place: the `RedactionAuditEvent` type carries the schema
-a shadow sink would consume, and the `PIIClient.FailOpen` flag already
-controls the enforce/allow decision at runtime.
+The `slog`-based sink that ships today is sufficient for
+pre-production shadow rollouts but is not itself a retention story.
 
-### Canary and kill switch
+### Canary routing
 
-Roll out filter config changes to a percentage of traffic first, with a
-one-flag kill switch that disables filtering globally or per-route when
-operational signals regress.
-
-Blocked on:
+Shadow mode already gives operators a feedback loop on "is the
+filter correct?", but does not answer "is the filter's LATENCY
+acceptable?". Answering that requires sending a cohort of real
+traffic through enforce mode while the rest is untouched. Canary
+routing is deferred on two blockers:
 
 - a control plane capable of sub-minute config pushes (Argo Rollouts,
   Flagger, or a custom EnvoyGateway extension);
-- an operator-facing API for canary cohorts and kill-switch scope
-  (global vs. per-route);
-- an alerting policy bound to the saturation gauges from L24.
+- an operator-facing API for cohort selection (header-based vs.
+  random-percent vs. tenant-based).
 
-Hooks already in place: the `AtomicDispatcher` pointer swap (L25)
-provides the hot-reload primitive, and `CardinalityGuard.OverflowCount()`
-gives a canary comparator a first-class "did this push explode the label
-set?" signal.
+The `AtomicDispatcher` pointer swap (L25) is the hot-reload
+primitive, so once the selector API is chosen, the gateway-side
+work is a matter of wiring the cohort signal into
+`MCPContentFilter.Mode` resolution.
 
 ### Nightly fuzz infrastructure
 

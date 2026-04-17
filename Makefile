@@ -295,11 +295,12 @@ build.%: ## Build a binary for the given command under the internal/cmd director
 		done; \
 	done
 
-# This builds the docker images for the controller, extproc and testupstream for the e2e tests.
+# This builds the docker images for the controller, extproc, content-filter and testupstream for the e2e tests.
 .PHONY: build-e2e
-build-e2e: ## Build the docker images for the controller, extproc and testupstream for the e2e tests.
+build-e2e: ## Build the docker images for the controller, extproc, content-filter and testupstream for the e2e tests.
 	@$(MAKE) docker-build.controller DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.extproc DOCKER_BUILD_ARGS="--load"
+	@$(MAKE) docker-build.content-filter DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.testupstream CMD_PATH_PREFIX=tests/internal/testupstreamlib DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.testmcpserver CMD_PATH_PREFIX=tests/internal/testmcp DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.testextauthserver CMD_PATH_PREFIX=tests/internal/testextauth DOCKER_BUILD_ARGS="--load"
@@ -381,6 +382,8 @@ helm-test: helm-package  ## Test the helm chart with a dummy version.
 	@$(GO_TOOL) helm template ${HELM_CHART_PATH} --set global.imagePullSecrets[0].name=testsecret | grep -q "imagePullSecrets:"
 	@$(GO_TOOL) helm template ${HELM_CHART_PATH} --set global.imagePullSecrets[0].name=testsecret | grep -q "name: testsecret"
 	@$(GO_TOOL) helm template ${HELM_CHART_PATH} --set global.imagePullSecrets[0].name=testsecret | grep -q -- "extProcImagePullSecrets=testsecret"
+	@# Verify the optional content-filter deployment renders with the expected image when enabled.
+	@$(GO_TOOL) helm template ${HELM_CHART_PATH} --set contentFilter.enabled=true | grep -q "docker.io/envoyproxy/ai-gateway-content-filter:${TAG}"
 
 # This pushes the helm chart to the OCI registry, requiring the access to the registry endpoint.
 .PHONY: helm-push
