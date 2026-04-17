@@ -26,13 +26,47 @@ Any service implementing that contract is acceptable — the evaluation
 policy in panacea-agent is one reference implementation, not the only
 one.
 
+## Two attachment shapes
+
+The filter body can be authored in either of two forms. Both are
+stable, both produce the same runtime behaviour, and they interact in
+one well-defined way (see [Precedence](#precedence) below):
+
+1. **Inline form** — `contentFilter: {...}` embedded on
+   `MCPRouteBackendRef`. The filter body lives inside the `MCPRoute`
+   spec. Convenient when a single team owns both the route and the
+   filter configuration.
+
+2. **Standalone form** — a top-level `MCPContentFilter` object whose
+   `spec.targetRefs` selects one or more (MCPRoute, backend) pairs.
+   The filter object lives in the same namespace as the route it
+   targets (direct policy attachment; no cross-namespace refs). This
+   is the canonical Gateway-API-style shape, and mirrors the way
+   `BackendSecurityPolicy` attaches to backends. Useful when
+   platform/security owns the filter config and application teams own
+   the route, or when one filter configuration should apply to many
+   routes/backends.
+
+### Precedence
+
+If both forms apply to the same backend, the standalone
+`MCPContentFilter` **wins** and the inline `contentFilter` value is
+ignored. Only one standalone filter may target a given (route,
+backend) pair; two or more is a configuration error and the gateway
+reconciler rejects the whole batch rather than silently merging.
+
+A standalone filter with `sectionName` set applies only to the named
+backend on the route; a standalone filter with no `sectionName`
+applies to every backend on the route.
+
 ## Files in this directory
 
-| File                             | Purpose                                                                                                 |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `gateway-route-shadow.yaml`      | Example `MCPRoute` wiring the filter into a Jira backend in **shadow mode** with 10% sampling.          |
-| `gateway-route-enforce.yaml`     | Same `MCPRoute` flipped to **enforce mode** with `failurePolicy: Fail`.                                 |
-| `global-kill-switch.yaml`        | Example `MCPContentFilterPolicy` ConfigMap for the cluster-wide `globalDisable` knob.                   |
+| File                            | Purpose                                                                                                                                                          |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gateway-route-shadow.yaml`     | **Inline form.** `MCPRoute` wiring the filter into a Jira backend in **shadow mode** with 10% sampling.                                                          |
+| `gateway-route-enforce.yaml`    | **Inline form.** Same `MCPRoute` flipped to **enforce mode** with `failurePolicy: Fail`.                                                                         |
+| `gateway-route-standalone.yaml` | **Standalone form.** Two top-level `MCPContentFilter` objects — one scoped to a single backend via `sectionName`, one attached route-wide with no `sectionName`. |
+| `global-kill-switch.yaml`       | Example `MCPContentFilterPolicy` ConfigMap for the cluster-wide `globalDisable` knob.                                                                            |
 
 ## Rollout recipe
 
@@ -58,7 +92,7 @@ reference it in the `MCPRoute` backend config below.
 A few deployment checks worth confirming on the filter Pod:
 
 - **Set an explicit `terminationGracePeriodSeconds`** on the filter
-  Pod equal to *at least* the longest `timeoutSeconds` you configure
+  Pod equal to _at least_ the longest `timeoutSeconds` you configure
   on any `MCPContentFilter` pointing at it, plus a small buffer
   (e.g. +5s) to cover connection draining. Without this, rolling
   the filter during peak traffic can cause in-flight filter calls

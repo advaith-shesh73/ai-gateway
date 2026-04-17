@@ -9,6 +9,7 @@ import (
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 )
 
 // MCPRoute defines how to route MCP requests to the backend MCP servers.
@@ -130,15 +131,148 @@ type MCPRouteBackendRef struct {
 	// where the gateway needs to rewrite request parameters or response
 	// content according to an external policy service.
 	//
+	// This field is the *inline* form and carries the filter body directly on
+	// the backend reference. Operators may alternatively author a standalone
+	// top-level MCPContentFilter object whose spec.targetRefs selects this
+	// MCPRoute (optionally scoped to this backend by sectionName). When a
+	// standalone MCPContentFilter targets this backend, it wins and the inline
+	// value here is ignored. See type MCPContentFilter for the standalone form.
+	//
 	// +kubebuilder:validation:Optional
 	// +optional
-	ContentFilter *MCPContentFilter `json:"contentFilter,omitempty"`
+	ContentFilter *MCPContentFilterConfig `json:"contentFilter,omitempty"`
 
 	// TODO: add fancy per-MCP server config. For example, Rate Limit, etc.
 }
 
-// MCPContentFilter configures an external HTTP service that inspects and
-// optionally rewrites MCP "tools/call" payloads for a single backend.
+// MCPContentFilter is a standalone, top-level policy object that attaches a
+// content filter to one or more MCPRoutes (optionally scoped to specific
+// backend references) via targetRefs. It is the analogue of
+// BackendSecurityPolicy for content filtering: one MCPContentFilter object
+// can be authored by a platform/security team and attached to routes owned
+// by separate application teams, without requiring edits to the MCPRoute
+// spec itself.
+//
+// # Relationship to the inline form
+//
+// The inline form lives on [MCPRouteBackendRef.ContentFilter] and carries the
+// same filter body ([MCPContentFilterConfig]) directly on the backend
+// reference. Operators may use either form, but they are NOT additive: when a
+// standalone MCPContentFilter's targetRefs selects a given (MCPRoute,
+// backend) pair, the standalone value wins and the inline value on that
+// backend reference is ignored. This is consistent with how
+// BackendSecurityPolicy overrides inline auth on AIServiceBackend.
+//
+// The same conflict resolution applies across multiple standalone objects: at
+// most one MCPContentFilter may target a given (MCPRoute, backend) pair. A
+// second match is a configuration error and the backend's filter collapses to
+// nil (plus a controller-emitted log) so traffic fails closed on policy
+// ambiguity rather than silently picking a "winner".
+//
+// # Target granularity
+//
+// Each entry in spec.targetRefs must have
+//
+//	group: aigateway.envoyproxy.io
+//	kind:  MCPRoute
+//	name:  <MCPRoute name>
+//
+// and may optionally carry
+//
+//	sectionName: <backend name>
+//
+// to scope the filter to a single backend reference on the route. Omitting
+// sectionName applies the filter to *every* backend on the targeted
+// MCPRoute. Cross-namespace references are not supported; the
+// MCPContentFilter object must live in the same namespace as the MCPRoute it
+// targets.
+//
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[-1:].type`
+// +kubebuilder:metadata:labels="gateway.networking.k8s.io/policy=direct"
+type MCPContentFilter struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// Spec defines the filter configuration and the set of MCPRoute/backend
+	// targets this filter attaches to.
+	Spec MCPContentFilterSpec `json:"spec,omitempty"`
+
+	// Status defines the status details of the MCPContentFilter.
+	Status MCPContentFilterStatus `json:"status,omitempty"`
+}
+
+// MCPContentFilterList contains a list of MCPContentFilter.
+//
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+type MCPContentFilterList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []MCPContentFilter `json:"items"`
+}
+
+// MCPContentFilterStatus defines observed state for a standalone
+// MCPContentFilter. Conditions follow the Gateway API policy conventions:
+//
+//   - Accepted:   the controller accepted the spec (references resolve,
+//     target type/group is correct, URL is a valid http(s) URI).
+//   - Conflicted: another MCPContentFilter already targets one of the
+//     same (MCPRoute, backend) pairs; this object's effect is suppressed
+//     on the overlapping targets. The message lists the conflicting
+//     targets for operator triage.
+type MCPContentFilterStatus struct {
+	// Conditions is the list of observed conditions for the MCPContentFilter.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=8
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MCPContentFilterSpec defines the desired state of a standalone
+// MCPContentFilter. It combines the attachment surface (TargetRefs) with the
+// filter body ([MCPContentFilterConfig], inlined).
+type MCPContentFilterSpec struct {
+	// TargetRefs selects the MCPRoutes (and, optionally via sectionName, the
+	// specific backend references on those routes) that this filter attaches
+	// to. At least one entry is required for the filter to have any effect.
+	//
+	// Each entry MUST reference an MCPRoute in the same namespace:
+	//
+	//	group: aigateway.envoyproxy.io
+	//	kind:  MCPRoute
+	//	name:  <MCPRoute name>
+	//
+	// Optionally carry
+	//
+	//	sectionName: <backend name>
+	//
+	// to scope the filter to a single backend entry on that MCPRoute. When
+	// sectionName is omitted, the filter applies to every backend on the
+	// targeted route.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(ref, ref.group == 'aigateway.envoyproxy.io' && ref.kind == 'MCPRoute')", message="targetRefs must reference aigateway.envoyproxy.io/MCPRoute"
+	TargetRefs []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName `json:"targetRefs"`
+
+	// MCPContentFilterConfig is the filter body. It is inlined so a standalone
+	// MCPContentFilter spec and an inline MCPRouteBackendRef.contentFilter
+	// carry IDENTICAL fields on the wire — only the attachment surface
+	// differs.
+	MCPContentFilterConfig `json:",inline"`
+}
+
+// MCPContentFilterConfig is the shared body of a content filter
+// configuration. It is used both inline on [MCPRouteBackendRef.ContentFilter]
+// and as the inlined payload of [MCPContentFilterSpec], so operators can move
+// a filter between inline and standalone forms without rewriting fields.
 //
 // For each invocation that matches one of the configured Scopes, the gateway
 // POSTs a JSON envelope to URL containing the JSON-RPC message and a subset
@@ -148,7 +282,7 @@ type MCPRouteBackendRef struct {
 // of the original. On reject, the gateway returns a JSON-RPC error to the
 // client and does not contact the backend (request scope) or forward the
 // response (response scope).
-type MCPContentFilter struct {
+type MCPContentFilterConfig struct {
 	// URL is the HTTP endpoint of the content filter service. Must use the
 	// http:// or https:// scheme. No other schemes are supported.
 	//

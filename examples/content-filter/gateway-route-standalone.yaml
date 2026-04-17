@@ -1,0 +1,213 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# STANDALONE-FORM example.
+#
+# The `MCPContentFilter` CRD is the canonical attachment shape for a
+# content filter: the filter body lives in its own object and selects
+# one or more (MCPRoute, backend) pairs via `spec.targetRefs`. This
+# mirrors the Gateway API "direct policy attachment" pattern used by
+# BackendSecurityPolicy and sibling policies.
+#
+# Operators may *also* author the same filter body inline on
+# `MCPRouteBackendRef.contentFilter` (see gateway-route-enforce.yaml).
+# Both shapes produce the same runtime behaviour. When both a standalone
+# MCPContentFilter and an inline value apply to the same backend, the
+# standalone wins; the inline value is ignored. Only one standalone
+# MCPContentFilter may target a given (MCPRoute, backend) pair, or the
+# entire reconcile is rejected — no silent merges.
+#
+# This manifest shows two uses of the standalone form in the same file:
+#
+#   1. A backend-scoped filter (sectionName set) that enforces redaction
+#      on a single backend on the route.
+#   2. A route-wide filter (sectionName omitted) attached to a second,
+#      otherwise-identical MCPRoute. It runs on every backend on that
+#      route in shadow mode, useful during progressive rollout across a
+#      fleet of backends.
+#
+# Both targeting styles live in the same namespace as the MCPRoute they
+# attach to — MCPContentFilter is a direct (same-namespace) policy, not
+# a cross-namespace reference.
+
+---
+# ---------------------------------------------------------------------
+# (1) Backend-scoped standalone filter.
+#
+# Attaches ONLY to the `jira-mcp` backend on the `jira-evaluation-route`
+# MCPRoute via `sectionName: jira-mcp`. The other backend on the same
+# route (`confluence-mcp`) is left untouched — it will fall back to its
+# inline `contentFilter` value if one is authored, or run unfiltered
+# otherwise.
+# ---------------------------------------------------------------------
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPContentFilter
+metadata:
+  name: jira-redactor
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+    content-filter.rollout: enforce
+spec:
+  targetRefs:
+    - group: aigateway.envoyproxy.io
+      kind: MCPRoute
+      name: jira-evaluation-route
+      sectionName: jira-mcp
+  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  scopes:
+    - Response
+  failurePolicy: Fail
+  timeoutSeconds: 65
+  mode: Enforce
+  enabled: true
+  forwardHeaders:
+    - "X-Eval-Ticket-Id"
+    - "X-Request-Id"
+
+---
+# ---------------------------------------------------------------------
+# (2) Route-wide standalone filter.
+#
+# No `sectionName`, so every backend on the target MCPRoute gets the
+# same filter configuration. Useful during a fleet-wide shadow rollout
+# where you want to observe filter behaviour on every backend of a
+# route without authoring one object per backend.
+# ---------------------------------------------------------------------
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPContentFilter
+metadata:
+  name: all-backends-shadow
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+    content-filter.rollout: shadow
+spec:
+  targetRefs:
+    - group: aigateway.envoyproxy.io
+      kind: MCPRoute
+      name: fleet-shadow-route
+  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  scopes:
+    - Response
+  failurePolicy: PassThrough
+  timeoutSeconds: 30
+  mode: Shadow
+  shadowSampleRatePermille: 100
+  enabled: true
+  forwardHeaders:
+    - "X-Request-Id"
+
+---
+# ---------------------------------------------------------------------
+# MCPRoute for the backend-scoped example.
+#
+# Deliberately LEAVES `contentFilter` empty on both backends: the
+# standalone MCPContentFilter `jira-redactor` above is what attaches to
+# `jira-mcp`. `confluence-mcp` is untargeted and runs unfiltered.
+# ---------------------------------------------------------------------
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: jira-evaluation-route
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  backendRefs:
+    - name: jira-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+    - name: confluence-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+
+---
+# ---------------------------------------------------------------------
+# MCPRoute for the route-wide example.
+# ---------------------------------------------------------------------
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: fleet-shadow-route
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  backendRefs:
+    - name: jira-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+    - name: confluence-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: jira-mcp
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: jira-mcp.example.com
+        port: 443
+
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: confluence-mcp
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: confluence-mcp.example.com
+        port: 443
+
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: jira-mcp-tls
+  namespace: default
+spec:
+  targetRefs:
+    - group: "gateway.envoyproxy.io"
+      kind: Backend
+      name: jira-mcp
+  validation:
+    wellKnownCACertificates: "System"
+    hostname: jira-mcp.example.com
+
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: confluence-mcp-tls
+  namespace: default
+spec:
+  targetRefs:
+    - group: "gateway.envoyproxy.io"
+      kind: Backend
+      name: confluence-mcp
+  validation:
+    wellKnownCACertificates: "System"
+    hostname: confluence-mcp.example.com

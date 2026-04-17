@@ -76,6 +76,13 @@ spec:
                         Typical uses are PII scrubbing and evaluation-mode source exclusion,
                         where the gateway needs to rewrite request parameters or response
                         content according to an external policy service.
+
+                        This field is the *inline* form and carries the filter body directly on
+                        the backend reference. Operators may alternatively author a standalone
+                        top-level MCPContentFilter object whose spec.targetRefs selects this
+                        MCPRoute (optionally scoped to this backend by sectionName). When a
+                        standalone MCPContentFilter targets this backend, it wins and the inline
+                        value here is ignored. See type MCPContentFilter for the standalone form.
                       properties:
                         enabled:
                           description: |-

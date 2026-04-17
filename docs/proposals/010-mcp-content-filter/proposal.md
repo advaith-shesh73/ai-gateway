@@ -3,8 +3,8 @@
 > **Post-merge note (2026):** This proposal is preserved as the
 > historical design record. The reference filter implementation and
 > in-process dispatcher (originally `cmd/content-filter/` +
-> `internal/contentfilter/` described below in the *Out-of-Process
-> Policy Service* and *Dispatcher Architecture* sections) have since
+> `internal/contentfilter/` described below in the _Out-of-Process
+> Policy Service_ and _Dispatcher Architecture_ sections) have since
 > been **moved out of ai-gateway** and now live in
 > [panacea-agent](https://github.com/nutanix-core/panacea-agent)
 > under `services/aigw-content-filter-dispatcher/` (dispatcher +
