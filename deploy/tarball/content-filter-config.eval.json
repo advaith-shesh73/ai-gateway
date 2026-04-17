@@ -1,0 +1,34 @@
+{
+    "_comment": "Template: copy to content-filter-config.active.json and replace placeholders. endpoint must be OpenAI-compatible. apiKeyEnv names the env var the container reads the Bearer token from.",
+    "addr": ":9093",
+    "policy": "eval",
+    "timeoutSeconds": 60,
+    "eval": {
+        "endpoint": "https://your-openai-compatible-endpoint.example.com/v1/chat/completions",
+        "model": "your-model-id",
+        "apiKeyEnv": "LLM_API_KEY",
+        "timeoutSeconds": 60,
+        "temperature": 0,
+        "insecureSkipTLSVerify": false,
+        "ticketHeader": "X-Eval-Ticket-Id",
+        "filteredTools": [
+            "jira_get_issue",
+            "jira_search",
+            "confluence_get_page",
+            "confluence_search",
+            "confluence_cql_search",
+            "find_similar_rcas",
+            "search_cases",
+            "extract_tickets",
+            "query_knowledge",
+            "get_case",
+            "get_similar_rca_by_jira",
+            "query",
+            "chat",
+            "web_search",
+            "read_document",
+            "search_employees",
+            "code_search"
+        ]
+    }
+}

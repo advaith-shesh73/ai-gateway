@@ -1,0 +1,19 @@
+# Build outputs staged for SCP to a deployment host. Large and
+# host-specific — never commit.
+tarball/aigw
+tarball/content-filter
+tarball/aigw-cf-deploy.tgz
+
+# Captured live gateway config (contains host-specific routing,
+# env vars, and session state). Never commit.
+tarball/config.yaml.current
+tarball/config.yaml.new
+
+# Scan artifacts / netio captures produced locally or fetched back
+# from a deployment host.
+tarball/scan.*.json
+tarball/scan.*.txt
+tarball/pr95-scan-*/
+
+# macOS extended-attribute sidecars.
+tarball/._*
