@@ -277,6 +277,21 @@ func TestMCPRoutes(t *testing.T) {
 			expErr: "spec.securityPolicy.authorization.rules[0].source.jwt: Invalid value: \"object\": either scopes or claims must be specified",
 		},
 		{name: "authorization_without_jwt_source.yaml"},
+		{name: "content_filter_basic.yaml"},
+		{name: "content_filter_response_only.yaml"},
+		{name: "content_filter_full.yaml"},
+		{
+			name:   "content_filter_empty_scopes.yaml",
+			expErr: "spec.backendRefs[0].contentFilter.scopes",
+		},
+		{
+			name:   "content_filter_invalid_url.yaml",
+			expErr: "spec.backendRefs[0].contentFilter.url",
+		},
+		{
+			name:   "content_filter_timeout_too_large.yaml",
+			expErr: "spec.backendRefs[0].contentFilter.timeoutSeconds",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data, err := testdata.ReadFile(path.Join("testdata/mcpgatewayroutes", tc.name))

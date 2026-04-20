@@ -9,6 +9,7 @@ import (
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 )
 
 // MCPRoute defines how to route MCP requests to the backend MCP servers.
@@ -121,8 +122,374 @@ type MCPRouteBackendRef struct {
 	// +optional
 	SecurityPolicy *MCPBackendSecurityPolicy `json:"securityPolicy,omitempty"`
 
+	// ContentFilter configures an optional external HTTP service that inspects
+	// and may rewrite "tools/call" payloads for this backend before they are
+	// forwarded to the MCP server (request scope) and/or after the response
+	// is returned (response scope).
+	//
+	// Typical uses are PII scrubbing and evaluation-mode source exclusion,
+	// where the gateway needs to rewrite request parameters or response
+	// content according to an external policy service.
+	//
+	// This field is the *inline* form and carries the filter body directly on
+	// the backend reference. Operators may alternatively author a standalone
+	// top-level MCPContentFilter object whose spec.targetRefs selects this
+	// MCPRoute (optionally scoped to this backend by sectionName). When a
+	// standalone MCPContentFilter targets this backend, it wins and the inline
+	// value here is ignored. See type MCPContentFilter for the standalone form.
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	ContentFilter *MCPContentFilterConfig `json:"contentFilter,omitempty"`
+
 	// TODO: add fancy per-MCP server config. For example, Rate Limit, etc.
 }
+
+// MCPContentFilter is a standalone, top-level policy object that attaches a
+// content filter to one or more MCPRoutes (optionally scoped to specific
+// backend references) via targetRefs. It is the analogue of
+// BackendSecurityPolicy for content filtering: one MCPContentFilter object
+// can be authored by a platform/security team and attached to routes owned
+// by separate application teams, without requiring edits to the MCPRoute
+// spec itself.
+//
+// # Relationship to the inline form
+//
+// The inline form lives on [MCPRouteBackendRef.ContentFilter] and carries the
+// same filter body ([MCPContentFilterConfig]) directly on the backend
+// reference. Operators may use either form, but they are NOT additive: when a
+// standalone MCPContentFilter's targetRefs selects a given (MCPRoute,
+// backend) pair, the standalone value wins and the inline value on that
+// backend reference is ignored. This is consistent with how
+// BackendSecurityPolicy overrides inline auth on AIServiceBackend.
+//
+// The same conflict resolution applies across multiple standalone objects: at
+// most one MCPContentFilter may target a given (MCPRoute, backend) pair. A
+// second match is a configuration error and the backend's filter collapses to
+// nil (plus a controller-emitted log) so traffic fails closed on policy
+// ambiguity rather than silently picking a "winner".
+//
+// # Target granularity
+//
+// Each entry in spec.targetRefs must have
+//
+//	group: aigateway.envoyproxy.io
+//	kind:  MCPRoute
+//	name:  <MCPRoute name>
+//
+// and may optionally carry
+//
+//	sectionName: <backend name>
+//
+// to scope the filter to a single backend reference on the route. Omitting
+// sectionName applies the filter to *every* backend on the targeted
+// MCPRoute. Cross-namespace references are not supported; the
+// MCPContentFilter object must live in the same namespace as the MCPRoute it
+// targets.
+//
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[-1:].type`
+// +kubebuilder:metadata:labels="gateway.networking.k8s.io/policy=direct"
+type MCPContentFilter struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// Spec defines the filter configuration and the set of MCPRoute/backend
+	// targets this filter attaches to.
+	Spec MCPContentFilterSpec `json:"spec,omitempty"`
+
+	// Status defines the status details of the MCPContentFilter.
+	Status MCPContentFilterStatus `json:"status,omitempty"`
+}
+
+// MCPContentFilterList contains a list of MCPContentFilter.
+//
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+type MCPContentFilterList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []MCPContentFilter `json:"items"`
+}
+
+// MCPContentFilterStatus defines observed state for a standalone
+// MCPContentFilter. Conditions follow the Gateway API policy conventions:
+//
+//   - Accepted:   the controller accepted the spec (references resolve,
+//     target type/group is correct, URL is a valid http(s) URI).
+//   - Conflicted: another MCPContentFilter already targets one of the
+//     same (MCPRoute, backend) pairs; this object's effect is suppressed
+//     on the overlapping targets. The message lists the conflicting
+//     targets for operator triage.
+type MCPContentFilterStatus struct {
+	// Conditions is the list of observed conditions for the MCPContentFilter.
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=8
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// MCPContentFilterSpec defines the desired state of a standalone
+// MCPContentFilter. It combines the attachment surface (TargetRefs) with the
+// filter body ([MCPContentFilterConfig], inlined).
+type MCPContentFilterSpec struct {
+	// TargetRefs selects the MCPRoutes (and, optionally via sectionName, the
+	// specific backend references on those routes) that this filter attaches
+	// to. At least one entry is required for the filter to have any effect.
+	//
+	// Each entry MUST reference an MCPRoute in the same namespace:
+	//
+	//	group: aigateway.envoyproxy.io
+	//	kind:  MCPRoute
+	//	name:  <MCPRoute name>
+	//
+	// Optionally carry
+	//
+	//	sectionName: <backend name>
+	//
+	// to scope the filter to a single backend entry on that MCPRoute. When
+	// sectionName is omitted, the filter applies to every backend on the
+	// targeted route.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(ref, ref.group == 'aigateway.envoyproxy.io' && ref.kind == 'MCPRoute')", message="targetRefs must reference aigateway.envoyproxy.io/MCPRoute"
+	TargetRefs []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName `json:"targetRefs"`
+
+	// MCPContentFilterConfig is the filter body. It is inlined so a standalone
+	// MCPContentFilter spec and an inline MCPRouteBackendRef.contentFilter
+	// carry IDENTICAL fields on the wire — only the attachment surface
+	// differs.
+	MCPContentFilterConfig `json:",inline"`
+}
+
+// MCPContentFilterConfig is the shared body of a content filter
+// configuration. It is used both inline on [MCPRouteBackendRef.ContentFilter]
+// and as the inlined payload of [MCPContentFilterSpec], so operators can move
+// a filter between inline and standalone forms without rewriting fields.
+//
+// For each invocation that matches one of the configured Scopes, the gateway
+// POSTs a JSON envelope to URL containing the JSON-RPC message and a subset
+// of the client's HTTP headers (selected by ForwardHeaders). The service
+// replies with an action of pass, redact, or reject. On redact, the
+// replacement JSON-RPC message supplied by the filter is forwarded in place
+// of the original. On reject, the gateway returns a JSON-RPC error to the
+// client and does not contact the backend (request scope) or forward the
+// response (response scope).
+type MCPContentFilterConfig struct {
+	// URL is the HTTP endpoint of the content filter service. Must use the
+	// http:// or https:// scheme. No other schemes are supported.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern=`^https?://.+$`
+	URL string `json:"url"`
+
+	// Scopes selects which phases of the tools/call lifecycle are sent to
+	// the filter. At least one must be specified.
+	// - "Request":  invoked before the tools/call is forwarded to the backend.
+	// - "Response": invoked after the backend returns, before the response is
+	//   written to the client.
+	//
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +listType=set
+	Scopes []MCPContentFilterScope `json:"scopes"`
+
+	// TimeoutSeconds is the per-invocation timeout applied when calling the
+	// filter service. If the filter does not respond before this deadline,
+	// FailurePolicy is applied.
+	//
+	// Defaults to 10 seconds. Must be between 1 and 120 inclusive.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=120
+	// +optional
+	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
+
+	// FailurePolicy controls behaviour when the gateway cannot obtain a
+	// definitive verdict from the filter service. This covers:
+	//   - connection refused / TCP reset / TLS handshake failure;
+	//   - filter service returns any non-2xx HTTP status;
+	//   - response body is not valid JSON or the action field is not one of
+	//     pass, redact, reject;
+	//   - the filter call exceeds TimeoutSeconds (gateway cancels the
+	//     request and treats it as failure).
+	//
+	// A filter that responds cleanly with action=reject is NOT a failure —
+	// it is a deliberate verdict and the gateway always honours it
+	// regardless of FailurePolicy (see error code -32010 on the client).
+	//
+	// - "PassThrough": the original JSON-RPC message is used and the tool
+	//   call continues. This is fail-open: the filter outage becomes
+	//   invisible to end-users but the gateway does NOT get to inspect the
+	//   body. Appropriate for filters whose role is best-effort redaction.
+	// - "Fail":        the gateway returns a JSON-RPC error to the client
+	//   (code -32011) and does NOT forward the request/response. This is
+	//   fail-closed. Appropriate for evaluation and compliance workloads
+	//   where an unscanned response is worse than no response.
+	//
+	// Every failure is observable regardless of policy: the gateway emits
+	// X-Content-Filter-Status=failed-open or unavailable, increments
+	// mcp_filter_status_total with the corresponding status label, and
+	// logs the underlying transport/parse/timeout error. Operators should
+	// page on sustained failed-open rates even when configured fail-open.
+	//
+	// Defaults to "PassThrough".
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	FailurePolicy *MCPContentFilterFailurePolicy `json:"failurePolicy,omitempty"`
+
+	// ForwardHeaders lists HTTP header names to copy from the client's
+	// incoming request into the filter invocation. Header names are
+	// case-insensitive. This enables tenant- or context-aware policy (for
+	// example, forwarding an evaluation-run ticket ID or a tenant ID).
+	//
+	// SECURITY: the filter service receives every header named here
+	// verbatim. Treat each entry as an intentional trust-boundary
+	// decision: the filter host, its logs, and any sidecar/network
+	// observer between the gateway and filter can observe the value.
+	//   - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,
+	//     or any header carrying a bearer token, session identifier, or
+	//     long-lived credential unless the filter is explicitly in-scope
+	//     for handling those secrets.
+	//   - Prefer opaque identifiers (request ID, tenant ID, evaluation
+	//     ticket ID) over headers derived from end-user credentials.
+	//   - If the filter runs in a different Kubernetes namespace or trust
+	//     zone than the gateway, forwarding user-bearing headers widens
+	//     the blast radius of a filter compromise.
+	// When in doubt, omit the header.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+
+	// Mode selects between Enforce (default) and Shadow. In Shadow mode
+	// the gateway still invokes the filter service, records the
+	// would-be verdict via X-Content-Filter-Status and
+	// mcp_filter_decisions_total, and emits redaction audit events, but
+	// always forwards the ORIGINAL body to the client (and backend on
+	// Request scope). Use Shadow during pre-production rollout to
+	// measure false-positive and false-negative rates on real traffic
+	// without impacting users. Operators flip back to Enforce to
+	// activate actual enforcement without a gateway restart.
+	//
+	// Defaults to "Enforce".
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	Mode *MCPContentFilterMode `json:"mode,omitempty"`
+
+	// Enabled toggles the filter for this backend without removing the
+	// configuration. When set to false the gateway forwards the tool
+	// call as if no content filter were configured for this backend and
+	// reports X-Content-Filter-Status: disabled on the response.
+	// Preserving the rest of the configuration lets operators
+	// re-enable the filter (possibly with adjusted Mode or
+	// FailurePolicy) via a single CRD update, without re-entering
+	// URL, scopes, timeout, or headers.
+	//
+	// Defaults to true. Use the process-wide kill switch
+	// (MCPContentFilterPolicy.GlobalDisable, distributed via the
+	// policy ConfigMap) to disable every filter in one step during
+	// an incident.
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// ShadowSampleRatePermille bounds the fraction of invocations
+	// actually evaluated when Mode is Shadow. It is expressed in
+	// permille (parts per thousand, 0..1000) so operators can set
+	// 0.1% granularity on high-traffic backends without switching
+	// to floating point. A value of 1000 means every shadow-mode
+	// invocation is evaluated (default, preserves backward compat).
+	// A value of 0 means the filter is never invoked and every
+	// shadow-mode call records action=shadow_sampled_out.
+	//
+	// Sampling happens BEFORE the filter service is contacted, so
+	// values < 1000 provide a hard cost and latency budget: an
+	// operator running shadow mode against an expensive LLM-based
+	// filter can cap traffic at e.g. 10 permille (1 %) while still
+	// producing a statistically meaningful sample for
+	// false-positive / false-negative dashboards.
+	//
+	// Ignored when Mode is Enforce (enforcement always evaluates
+	// every call — sampling enforcement would leak content).
+	//
+	// Defaults to 1000.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	ShadowSampleRatePermille *int32 `json:"shadowSampleRatePermille,omitempty"`
+}
+
+// MCPContentFilterScope selects a phase of the tools/call lifecycle.
+//
+// +kubebuilder:validation:Enum=Request;Response
+type MCPContentFilterScope string
+
+const (
+	// MCPContentFilterScopeRequest invokes the filter before forwarding the
+	// tools/call request to the backend.
+	MCPContentFilterScopeRequest MCPContentFilterScope = "Request"
+	// MCPContentFilterScopeResponse invokes the filter after the backend
+	// responds, before the response is written to the client.
+	MCPContentFilterScopeResponse MCPContentFilterScope = "Response"
+)
+
+// MCPContentFilterFailurePolicy controls how the gateway reacts when the
+// filter service is unavailable or errors.
+//
+// +kubebuilder:validation:Enum=PassThrough;Fail
+type MCPContentFilterFailurePolicy string
+
+const (
+	// MCPContentFilterFailurePolicyPassThrough forwards the unmodified
+	// request or response when the filter service cannot be consulted.
+	// This is the default and is fail-open.
+	MCPContentFilterFailurePolicyPassThrough MCPContentFilterFailurePolicy = "PassThrough"
+	// MCPContentFilterFailurePolicyFail causes the tool call to fail with a
+	// JSON-RPC error when the filter service cannot be consulted. Use this
+	// when serving unscanned content is worse than failing the call.
+	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
+
+// MCPContentFilterMode selects between enforcement and shadow evaluation.
+//
+// +kubebuilder:validation:Enum=Enforce;Shadow
+type MCPContentFilterMode string
+
+const (
+	// MCPContentFilterModeEnforce applies the filter's verdict to the
+	// client-visible response: on redact the rewritten body is forwarded,
+	// on reject a JSON-RPC error is returned. This is the default.
+	MCPContentFilterModeEnforce MCPContentFilterMode = "Enforce"
+	// MCPContentFilterModeShadow invokes the filter and records the
+	// verdict (X-Content-Filter-Status header, mcp_filter_decisions_total
+	// counter with action=shadow_would_*, redaction audit events) but
+	// forwards the ORIGINAL body to the client. Use Shadow mode for
+	// pre-production evaluation: operators can measure what WOULD be
+	// redacted or rejected on real traffic before committing to
+	// enforcement. Shadow mode never surfaces filter errors as
+	// client-visible failures — a would-be reject on a fail-closed
+	// policy still forwards the original body, and fail-open
+	// behaviour is indistinguishable from a successful would-be pass.
+	MCPContentFilterModeShadow MCPContentFilterMode = "Shadow"
+)
 
 // MCPToolFilter filters tools using include and exclude patterns with exact matches or regular expressions.
 // Exclude rules take precedence over include rules (deny-wins). When both include and exclude are specified,

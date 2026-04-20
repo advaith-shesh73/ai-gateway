@@ -27,6 +27,7 @@ The MCP Gateway acts as a transparent proxy between MCP clients (AI agents like 
 | **Fine-Grained Authorization**         | Native enforcement of [OAuth authentication flows](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization).<br/>Implement granular access control using JWT claims, scopes, and CEL expressions.                                              |
 | **Server Multiplexing & Tool Routing** | Route tool calls to the right MCP backends, aggregating and filtering available tools based on gateway policy.<br/>Dynamically merge streaming notifications from multiple MCP servers into a unified interface.                                                    |
 | **Upstream Authentication**            | Built-in upstream authentication primitives to securely connect to external MCP servers using API keys and header injection.                                                                                                                                        |
+| **Content Filters**                    | Delegate per-backend `tools/call` request and response inspection to an external HTTP service. Supports payload rewrite, source-level exclusions, PII redaction, and hard reject, with configurable timeout and fail-open/fail-closed policy.                       |
 | **Full MCP Spec Coverage**             | Complete [June 2025 MCP spec](https://modelcontextprotocol.io/specification/2025-06-18) compliance, including support for tool calls, notifications, prompts, resources, and bi-directional server-to-client requests.                                              |
 | **Built-in Observability**             | OpenTelemetry tracing and Prometheus metrics for all MCP requests, using the same observability stack as LLM traffic.                                                                                                                                               |
 
@@ -365,6 +366,240 @@ authorization:
           - backend: mcp-backend
             tool: sum
 ```
+
+### Content Filters
+
+Content filters let you delegate per-backend request and response inspection
+to an external HTTP service. They are configured on a `MCPRouteBackendRef`
+and run at tool-call time, giving the filter the chance to observe, rewrite,
+or reject individual `tools/call` payloads without the gateway understanding
+the domain-specific shape of the tool.
+
+Typical uses include:
+
+- Injecting source-level exclusions (for example, an `exclude_ticket_ids`
+  parameter) so a backend never sees data it should not search.
+- Detecting and redacting PII in tool responses before they reach the caller.
+- Replacing a raw backend response with a sanitized version (for example,
+  a "creation-time" recreation of a ticket rather than its current state).
+
+The filter is invoked separately at each configured scope:
+
+- `Request` &mdash; runs **before** the gateway forwards the tool call to the
+  backend. The filter can rewrite the JSON-RPC request or reject the call.
+- `Response` &mdash; runs **after** the backend response is received and any
+  built-in response modifications have been applied, but before the response
+  is written back to the client. The filter can rewrite the JSON-RPC
+  response or reject it.
+
+#### Configuration
+
+The filter body is a stable value shape that may be authored in either
+of two forms:
+
+1. **Inline form** — `contentFilter: {...}` on `MCPRouteBackendRef`. The
+   configuration lives inside the `MCPRoute` spec. Convenient when the
+   same team owns both the route and the filter policy.
+2. **Standalone form** — a top-level `MCPContentFilter` object whose
+   `spec.targetRefs` selects one or more (MCPRoute, backend) pairs.
+   Mirrors the Gateway API direct-policy-attachment pattern already
+   used by `BackendSecurityPolicy`. Useful when a
+   platform/security team owns the filter configuration and
+   application teams own the routes, or when one filter should apply
+   to many routes/backends.
+
+Both forms produce the same runtime behaviour. When both apply to the
+same backend, the **standalone form wins** and the inline value is
+ignored. Only one standalone `MCPContentFilter` may target a given
+(MCPRoute, backend) pair; conflicting attachments fail the entire
+reconcile rather than silently merging.
+
+##### Inline form
+
+```yaml
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: mcp-route
+spec:
+  backendRefs:
+    - name: supportgpt
+      contentFilter:
+        url: http://content-filter.mcp.svc.cluster.local:8080/filter
+        scopes: [Request, Response]
+        timeoutSeconds: 10
+        failurePolicy: PassThrough
+        forwardHeaders:
+          - x-request-id
+          - x-tenant-id
+```
+
+##### Standalone form
+
+```yaml
+# Route + backends carry no inline filter config.
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: mcp-route
+  namespace: default
+spec:
+  backendRefs:
+    - name: supportgpt
+---
+# Filter body lives on its own object, selecting the route + backend
+# above via targetRefs. sectionName pins the attachment to a specific
+# backend; omit sectionName to apply route-wide (every backend).
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPContentFilter
+metadata:
+  name: supportgpt-filter
+  namespace: default
+spec:
+  targetRefs:
+    - group: aigateway.envoyproxy.io
+      kind: MCPRoute
+      name: mcp-route
+      sectionName: supportgpt
+  url: http://content-filter.mcp.svc.cluster.local:8080/filter
+  scopes: [Request, Response]
+  timeoutSeconds: 10
+  failurePolicy: PassThrough
+  forwardHeaders:
+    - x-request-id
+    - x-tenant-id
+```
+
+The `MCPContentFilter` object must live in the **same namespace** as
+the `MCPRoute` it targets — it is a direct policy attachment, not a
+cross-namespace reference.
+
+| Field                      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`                      | HTTP endpoint of the filter service. Must use `http://` or `https://`.                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `scopes`                   | One or both of `Request` and `Response`. The filter is only invoked at the scopes listed here.                                                                                                                                                                                                                                                                                                                                                                                    |
+| `timeoutSeconds`           | Per-invocation timeout (default `10`, max `120`).                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `failurePolicy`            | `PassThrough` (default, fail-open) forwards the unmodified payload when the filter is unreachable, returns non-2xx, returns malformed JSON, or exceeds `timeoutSeconds`. `Fail` (fail-closed) aborts the call with JSON-RPC error `-32011`. `reject` from the filter always aborts the call with `-32010`, regardless of policy. Every failure increments `mcp_filter_status_total{status="failed-open"\|"unavailable"}`; page on sustained rates even when configured fail-open. |
+| `forwardHeaders`           | Optional list of client-request header names (case-insensitive, at most 16 entries) copied into the filter request. **SECURITY:** each entry is sent verbatim to the filter host and its observers — NEVER list `Authorization`, `Cookie`, `Proxy-Authorization`, or any header carrying a bearer token or session identifier unless the filter is explicitly in-scope for handling those secrets. Prefer opaque IDs (request ID, tenant ID, evaluation ticket ID).               |
+| `mode`                     | `Enforce` (default) applies the filter verdict. `Shadow` invokes the filter but always forwards the ORIGINAL body; verdicts are recorded via `X-Content-Filter-Status`, `mcp_filter_decisions_total`, and redaction audit events.                                                                                                                                                                                                                                                 |
+| `enabled`                  | Per-backend kill switch (default `true`). Setting `false` skips the filter entirely and emits `X-Content-Filter-Status: disabled`. Configuration is preserved for easy re-enable.                                                                                                                                                                                                                                                                                                 |
+| `shadowSampleRatePermille` | Sampling budget in permille (0..1000, default `1000`). Applies only when `mode: Shadow`. Values below 1000 cap LLM cost; invocations that are not sampled record `action=shadow_sampled_out` and skip the filter call.                                                                                                                                                                                                                                                            |
+
+#### Safe rollout: shadow mode, kill switches, sampling
+
+The filter supports a full progressive-delivery lifecycle without any
+external rollout tooling:
+
+1. **Shadow mode** (`mode: Shadow`). The filter is invoked on every
+   eligible call but the gateway always forwards the ORIGINAL body to
+   the client. The verdict is recorded as
+   `action=shadow_would_{pass,redact,reject,fail}` on the
+   `mcp_filter_decisions_total` counter and on the
+   `X-Content-Filter-Status` header. Use shadow mode to measure
+   false-positive / false-negative rates on real traffic before
+   committing to enforcement.
+
+2. **Sample rate** (`shadowSampleRatePermille`). Bounds how many
+   shadow-mode calls are actually sent to the filter. Expressed in
+   permille (parts per thousand) so 0.1% granularity is cheap:
+   `shadowSampleRatePermille: 100` means 10% of eligible calls hit
+   the filter, the remaining 90% short-circuit with
+   `action=shadow_sampled_out`. Ignored in enforce mode; enforcing a
+   sampled fraction would leak content intermittently.
+
+3. **Per-backend kill switch** (`enabled: false`). Stops filtering on
+   a single backend without editing the rest of the route. Config is
+   preserved so re-enabling is one `kubectl edit` away.
+
+4. **Cluster-wide kill switch** (`MCPContentFilterPolicy.globalDisable`).
+   Lives in the process-wide ConfigMap (see
+   `internal/filterapi/mcp_content_filter_policy.go`). Flipping it to
+   `true` disables every filter on every backend in the cluster —
+   the intended knob for incident response.
+
+All four knobs hot-reload through the controller's CRD watch and the
+gateway's atomic config pointer swap; changing any of them does NOT
+require a gateway pod restart.
+
+```yaml
+# Shadow rollout at 10% sampling
+- name: supportgpt
+  contentFilter:
+    url: http://content-filter.mcp.svc.cluster.local:8080/filter
+    scopes: [Response]
+    mode: Shadow
+    shadowSampleRatePermille: 100
+    enabled: true
+```
+
+```yaml
+# Production enforcement with fail-closed (unscanned == no response)
+- name: supportgpt
+  contentFilter:
+    url: http://content-filter.mcp.svc.cluster.local:8080/filter
+    scopes: [Response]
+    mode: Enforce
+    failurePolicy: Fail
+    enabled: true
+```
+
+See [`examples/content-filter/`](https://github.com/envoyproxy/ai-gateway/tree/main/examples/content-filter)
+for example manifests: `MCPRoute` with the inline filter shape in both
+shadow and enforce modes (`gateway-route-shadow.yaml`,
+`gateway-route-enforce.yaml`), top-level `MCPContentFilter` objects in
+both backend-scoped and route-wide variants
+(`gateway-route-standalone.yaml`), and the `MCPContentFilterPolicy`
+cluster-wide kill-switch ConfigMap (`global-kill-switch.yaml`). The
+reference filter service itself (LLM-powered evaluation-mode redactor)
+lives with `panacea-agent` under `services/aigw-content-filter-dispatcher/`.
+
+#### Wire Protocol
+
+The gateway `POST`s a JSON envelope to the filter URL and expects a JSON
+envelope back. The body of the tool call is base64-encoded so it can carry
+arbitrary byte sequences without re-encoding.
+
+Request (gateway &rarr; filter):
+
+```json
+{
+  "route": "mcp-route",
+  "backend": "supportgpt",
+  "scope": "Request",
+  "mcpMethod": "tools/call",
+  "tool": "lookup",
+  "headers": { "x-tenant-id": "acme" },
+  "bodyBase64": "eyJqc29ucnBjIjoiMi4wIiwgLi4uIH0=",
+  "contentType": "application/json"
+}
+```
+
+Response (filter &rarr; gateway):
+
+```json
+{
+  "action": "redact",
+  "bodyBase64": "eyJqc29ucnBjIjoiMi4wIiwgLi4uIH0=",
+  "reason": "removed PII from result"
+}
+```
+
+`action` must be one of `pass`, `redact`, or `reject`. `redact` requires a
+`bodyBase64` replacement; `reject` optionally carries a `reason` string that
+is surfaced to the caller via the JSON-RPC error envelope.
+
+The gateway emits two dedicated JSON-RPC error codes back to the MCP client
+on filter-related aborts:
+
+| Code     | When it is emitted                                                                                                                                                                                                                                                                                               |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-32010` | The filter returned `action: reject` (either request- or response-scope). The filter's `reason` is surfaced in the error message. The gateway always honours a reject regardless of `failurePolicy`.                                                                                                             |
+| `-32011` | The filter could not be consulted (connection refused, non-2xx, malformed body, timeout) AND `failurePolicy: Fail` was configured. The gateway refuses to serve unscanned content and aborts the call. With the default `failurePolicy: PassThrough` the gateway silently forwards the original payload instead. |
+
+Both codes fall inside the MCP implementation-defined range and are
+stable across gateway releases. Clients can rely on them to distinguish
+"the filter decided no" (-32010, user-visible policy violation) from
+"the filter was broken" (-32011, operator-visible infrastructure issue).
 
 ## See Also
 

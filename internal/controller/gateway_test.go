@@ -260,7 +260,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 	for range 2 { // Reconcile twice to make sure the secret update path is working.
 		const someNamespace = "some-namespace"
 		configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid")
 		require.NoError(t, err)
 		require.True(t, effective, "expected filter config to be effective")
 
@@ -379,7 +379,7 @@ func TestGatewayController_reconcileFilterConfigSecret_SkipsDeletedRoutes(t *tes
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
 	// Reconcile filter config secret.
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid")
 	require.NoError(t, err)
 	require.True(t, effective, "expected filter config to be effective")
 
@@ -1737,10 +1737,10 @@ func TestGatewayController_reconcileFilterMCPConfigSecret(t *testing.T) {
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, "mcp-uuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, nil, "mcp-uuid")
 	require.NoError(t, err)
 	require.False(t, effective) // No MCP routes, so not effective.
-	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, "mcp-uuid")
+	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, nil, "mcp-uuid")
 	require.NoError(t, err)
 	require.True(t, effective)
 
@@ -1776,7 +1776,8 @@ func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
 		},
 	}
 
-	mc, effective := mcpConfig(mcpRoutes)
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
 	require.True(t, effective)
 	require.NotNil(t, mc)
 	require.Len(t, mc.Routes, 1)
@@ -1786,6 +1787,290 @@ func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
 	require.Equal(t, []string{"toolA"}, ts.Include)
 	require.Equal(t, []string{"toolB"}, ts.Exclude)
 	require.Equal(t, []string{"^secret.*"}, ts.ExcludeRegex)
+}
+
+func Test_mcpConfig_ContentFilter(t *testing.T) {
+	timeout := int32(30)
+	failPolicy := aigv1a1.MCPContentFilterFailurePolicyFail
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{
+						// Backend with both scopes and a custom failure
+						// policy, timeout, and forward headers.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("supportgpt"),
+						},
+						ContentFilter: &aigv1a1.MCPContentFilterConfig{
+							URL: "http://content-filter.svc.cluster.local:8080/filter",
+							Scopes: []aigv1a1.MCPContentFilterScope{
+								aigv1a1.MCPContentFilterScopeRequest,
+								aigv1a1.MCPContentFilterScopeResponse,
+							},
+							TimeoutSeconds: &timeout,
+							FailurePolicy:  &failPolicy,
+							ForwardHeaders: []string{"x-ticket-id", "x-request-id"},
+						},
+					},
+					{
+						// Backend with no content filter at all.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("plain"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.NotNil(t, mc)
+	require.Len(t, mc.Routes, 1)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	// Sort-stable lookup so the test isn't sensitive to slice ordering.
+	var withCF, withoutCF *filterapi.MCPBackend
+	for i := range mc.Routes[0].Backends {
+		b := &mc.Routes[0].Backends[i]
+		if b.Name == "supportgpt" {
+			withCF = b
+		} else {
+			withoutCF = b
+		}
+	}
+	require.NotNil(t, withCF)
+	require.NotNil(t, withoutCF)
+
+	require.Nil(t, withoutCF.ContentFilter, "backends without contentFilter spec must translate to nil")
+
+	cf := withCF.ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, "http://content-filter.svc.cluster.local:8080/filter", cf.URL)
+	require.ElementsMatch(t,
+		[]filterapi.MCPContentFilterScope{
+			filterapi.MCPContentFilterScopeRequest,
+			filterapi.MCPContentFilterScopeResponse,
+		},
+		cf.Scopes,
+	)
+	require.Equal(t, int32(30), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicyFail, cf.FailurePolicy)
+	require.Equal(t, []string{"x-ticket-id", "x-request-id"}, cf.ForwardHeaders)
+}
+
+func Test_mcpConfig_ContentFilter_Defaults(t *testing.T) {
+	// When TimeoutSeconds and FailurePolicy are unset on the CRD, the
+	// translated config must expose them as zero values so that
+	// compileContentFilter can apply its defaults (10s / PassThrough).
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{
+						Name: gwapiv1.ObjectName("b"),
+					},
+					ContentFilter: &aigv1a1.MCPContentFilterConfig{
+						URL:    "https://cf.example.com",
+						Scopes: []aigv1a1.MCPContentFilterScope{aigv1a1.MCPContentFilterScopeRequest},
+					},
+				}},
+			},
+		},
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
+	require.True(t, effective)
+	cf := mc.Routes[0].Backends[0].ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, int32(0), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicy(""), cf.FailurePolicy)
+	require.Empty(t, cf.ForwardHeaders)
+}
+
+// newMCPContentFilter builds a standalone MCPContentFilter targeting the
+// given route and (optionally) a specific backend via sectionName. Used by
+// the precedence / conflict tests below.
+func newMCPContentFilter(namespace, name, routeName string, sectionName *string, url string) aigv1a1.MCPContentFilter {
+	// gwapiv1a2.LocalPolicyTargetReferenceWithSectionName is a defined type
+	// whose underlying struct embeds the *v1* variant of
+	// LocalPolicyTargetReference (both versions alias the same shape, but
+	// the struct literal has to match the underlying type exactly).
+	refs := []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName{{
+		LocalPolicyTargetReference: gwapiv1.LocalPolicyTargetReference{
+			Group: aigv1a1.GroupName,
+			Kind:  "MCPRoute",
+			Name:  gwapiv1.ObjectName(routeName),
+		},
+	}}
+	if sectionName != nil {
+		sn := gwapiv1.SectionName(*sectionName)
+		refs[0].SectionName = &sn
+	}
+	return aigv1a1.MCPContentFilter{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: aigv1a1.MCPContentFilterSpec{
+			TargetRefs: refs,
+			MCPContentFilterConfig: aigv1a1.MCPContentFilterConfig{
+				URL: url,
+				Scopes: []aigv1a1.MCPContentFilterScope{
+					aigv1a1.MCPContentFilterScopeRequest,
+					aigv1a1.MCPContentFilterScopeResponse,
+				},
+			},
+		},
+	}
+}
+
+// Test_mcpConfig_ContentFilter_Standalone verifies that a standalone
+// MCPContentFilter with a sectionName attaches only to the matching backend.
+func Test_mcpConfig_ContentFilter_Standalone(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "supportgpt"}},
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "plain"}},
+				},
+			},
+		},
+	}
+	section := "supportgpt"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf1", "route", &section, "http://cf.example.com/filter"),
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	var withCF, withoutCF *filterapi.MCPBackend
+	for i := range mc.Routes[0].Backends {
+		b := &mc.Routes[0].Backends[i]
+		switch b.Name {
+		case "supportgpt":
+			withCF = b
+		case "plain":
+			withoutCF = b
+		}
+	}
+	require.NotNil(t, withCF)
+	require.NotNil(t, withoutCF)
+	require.NotNil(t, withCF.ContentFilter, "standalone filter must attach to the targeted backend")
+	require.Equal(t, "http://cf.example.com/filter", withCF.ContentFilter.URL)
+	require.Nil(t, withoutCF.ContentFilter, "other backends on the same route must not receive the filter")
+}
+
+// Test_mcpConfig_ContentFilter_StandaloneRouteWide verifies that a target ref
+// without a sectionName attaches to every backend on the targeted route.
+func Test_mcpConfig_ContentFilter_StandaloneRouteWide(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "a"}},
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"}},
+				},
+			},
+		},
+	}
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf-all", "route", nil, "http://cf.example.com/filter"),
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	for _, b := range mc.Routes[0].Backends {
+		require.NotNilf(t, b.ContentFilter, "backend %q expected to inherit route-wide filter", b.Name)
+		require.Equal(t, "http://cf.example.com/filter", b.ContentFilter.URL)
+	}
+}
+
+// Test_mcpConfig_ContentFilter_Precedence verifies that when both inline and
+// standalone filters select the same backend, the standalone value wins.
+func Test_mcpConfig_ContentFilter_Precedence(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "supportgpt"},
+					ContentFilter: &aigv1a1.MCPContentFilterConfig{
+						URL:    "http://inline.example.com/filter",
+						Scopes: []aigv1a1.MCPContentFilterScope{aigv1a1.MCPContentFilterScopeRequest},
+					},
+				}},
+			},
+		},
+	}
+	section := "supportgpt"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf-override", "route", &section, "http://standalone.example.com/filter"),
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.NotNil(t, mc.Routes[0].Backends[0].ContentFilter)
+	require.Equal(t, "http://standalone.example.com/filter", mc.Routes[0].Backends[0].ContentFilter.URL,
+		"standalone MCPContentFilter must override any inline value on conflict")
+}
+
+// Test_mcpConfig_ContentFilter_Conflict verifies that two standalone filters
+// selecting the same (route, backend) pair are rejected with an error.
+func Test_mcpConfig_ContentFilter_Conflict(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"},
+				}},
+			},
+		},
+	}
+	section := "b"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf1", "route", &section, "http://a.example.com/filter"),
+		newMCPContentFilter("ns", "cf2", "route", &section, "http://b.example.com/filter"),
+	}
+	_, _, err := mcpConfig(mcpRoutes, filters)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "multiple MCPContentFilter")
+	require.Contains(t, err.Error(), "ns/cf1")
+	require.Contains(t, err.Error(), "ns/cf2")
+}
+
+// Test_mcpConfig_ContentFilter_NamespaceScoped verifies that a standalone
+// filter in a different namespace is ignored (MCPContentFilter attaches only
+// to MCPRoutes in its own namespace).
+func Test_mcpConfig_ContentFilter_NamespaceScoped(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"},
+				}},
+			},
+		},
+	}
+	section := "b"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("other-ns", "cf-stray", "route", &section, "http://stray.example.com/filter"),
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.Nil(t, mc.Routes[0].Backends[0].ContentFilter,
+		"cross-namespace MCPContentFilter must not attach")
 }
 
 func Test_mergeHeaderMutations(t *testing.T) {

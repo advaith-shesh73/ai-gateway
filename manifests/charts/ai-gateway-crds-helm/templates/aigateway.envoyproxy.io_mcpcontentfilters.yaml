@@ -1,0 +1,376 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  labels:
+    gateway.networking.k8s.io/policy: direct
+  name: mcpcontentfilters.aigateway.envoyproxy.io
+spec:
+  group: aigateway.envoyproxy.io
+  names:
+    kind: MCPContentFilter
+    listKind: MCPContentFilterList
+    plural: mcpcontentfilters
+    singular: mcpcontentfilter
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[-1:].type
+      name: Status
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: "MCPContentFilter is a standalone, top-level policy object that
+          attaches a\ncontent filter to one or more MCPRoutes (optionally scoped to
+          specific\nbackend references) via targetRefs. It is the analogue of\nBackendSecurityPolicy
+          for content filtering: one MCPContentFilter object\ncan be authored by a
+          platform/security team and attached to routes owned\nby separate application
+          teams, without requiring edits to the MCPRoute\nspec itself.\n\n# Relationship
+          to the inline form\n\nThe inline form lives on [MCPRouteBackendRef.ContentFilter]
+          and carries the\nsame filter body ([MCPContentFilterConfig]) directly on
+          the backend\nreference. Operators may use either form, but they are NOT
+          additive: when a\nstandalone MCPContentFilter's targetRefs selects a given
+          (MCPRoute,\nbackend) pair, the standalone value wins and the inline value
+          on that\nbackend reference is ignored. This is consistent with how\nBackendSecurityPolicy
+          overrides inline auth on AIServiceBackend.\n\nThe same conflict resolution
+          applies across multiple standalone objects: at\nmost one MCPContentFilter
+          may target a given (MCPRoute, backend) pair. A\nsecond match is a configuration
+          error and the backend's filter collapses to\nnil (plus a controller-emitted
+          log) so traffic fails closed on policy\nambiguity rather than silently picking
+          a \"winner\".\n\n# Target granularity\n\nEach entry in spec.targetRefs must
+          have\n\n\tgroup: aigateway.envoyproxy.io\n\tkind:  MCPRoute\n\tname:  <MCPRoute
+          name>\n\nand may optionally carry\n\n\tsectionName: <backend name>\n\nto
+          scope the filter to a single backend reference on the route. Omitting\nsectionName
+          applies the filter to *every* backend on the targeted\nMCPRoute. Cross-namespace
+          references are not supported; the\nMCPContentFilter object must live in
+          the same namespace as the MCPRoute it\ntargets."
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              Spec defines the filter configuration and the set of MCPRoute/backend
+              targets this filter attaches to.
+            properties:
+              enabled:
+                description: |-
+                  Enabled toggles the filter for this backend without removing the
+                  configuration. When set to false the gateway forwards the tool
+                  call as if no content filter were configured for this backend and
+                  reports X-Content-Filter-Status: disabled on the response.
+                  Preserving the rest of the configuration lets operators
+                  re-enable the filter (possibly with adjusted Mode or
+                  FailurePolicy) via a single CRD update, without re-entering
+                  URL, scopes, timeout, or headers.
+
+                  Defaults to true. Use the process-wide kill switch
+                  (MCPContentFilterPolicy.GlobalDisable, distributed via the
+                  policy ConfigMap) to disable every filter in one step during
+                  an incident.
+                type: boolean
+              failurePolicy:
+                description: |-
+                  FailurePolicy controls behaviour when the gateway cannot obtain a
+                  definitive verdict from the filter service. This covers:
+                    - connection refused / TCP reset / TLS handshake failure;
+                    - filter service returns any non-2xx HTTP status;
+                    - response body is not valid JSON or the action field is not one of
+                      pass, redact, reject;
+                    - the filter call exceeds TimeoutSeconds (gateway cancels the
+                      request and treats it as failure).
+
+                  A filter that responds cleanly with action=reject is NOT a failure —
+                  it is a deliberate verdict and the gateway always honours it
+                  regardless of FailurePolicy (see error code -32010 on the client).
+
+                  - "PassThrough": the original JSON-RPC message is used and the tool
+                    call continues. This is fail-open: the filter outage becomes
+                    invisible to end-users but the gateway does NOT get to inspect the
+                    body. Appropriate for filters whose role is best-effort redaction.
+                  - "Fail":        the gateway returns a JSON-RPC error to the client
+                    (code -32011) and does NOT forward the request/response. This is
+                    fail-closed. Appropriate for evaluation and compliance workloads
+                    where an unscanned response is worse than no response.
+
+                  Every failure is observable regardless of policy: the gateway emits
+                  X-Content-Filter-Status=failed-open or unavailable, increments
+                  mcp_filter_status_total with the corresponding status label, and
+                  logs the underlying transport/parse/timeout error. Operators should
+                  page on sustained failed-open rates even when configured fail-open.
+
+                  Defaults to "PassThrough".
+                enum:
+                - PassThrough
+                - Fail
+                type: string
+              forwardHeaders:
+                description: |-
+                  ForwardHeaders lists HTTP header names to copy from the client's
+                  incoming request into the filter invocation. Header names are
+                  case-insensitive. This enables tenant- or context-aware policy (for
+                  example, forwarding an evaluation-run ticket ID or a tenant ID).
+
+                  SECURITY: the filter service receives every header named here
+                  verbatim. Treat each entry as an intentional trust-boundary
+                  decision: the filter host, its logs, and any sidecar/network
+                  observer between the gateway and filter can observe the value.
+                    - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,
+                      or any header carrying a bearer token, session identifier, or
+                      long-lived credential unless the filter is explicitly in-scope
+                      for handling those secrets.
+                    - Prefer opaque identifiers (request ID, tenant ID, evaluation
+                      ticket ID) over headers derived from end-user credentials.
+                    - If the filter runs in a different Kubernetes namespace or trust
+                      zone than the gateway, forwarding user-bearing headers widens
+                      the blast radius of a filter compromise.
+                  When in doubt, omit the header.
+                items:
+                  type: string
+                maxItems: 16
+                type: array
+              mode:
+                description: |-
+                  Mode selects between Enforce (default) and Shadow. In Shadow mode
+                  the gateway still invokes the filter service, records the
+                  would-be verdict via X-Content-Filter-Status and
+                  mcp_filter_decisions_total, and emits redaction audit events, but
+                  always forwards the ORIGINAL body to the client (and backend on
+                  Request scope). Use Shadow during pre-production rollout to
+                  measure false-positive and false-negative rates on real traffic
+                  without impacting users. Operators flip back to Enforce to
+                  activate actual enforcement without a gateway restart.
+
+                  Defaults to "Enforce".
+                enum:
+                - Enforce
+                - Shadow
+                type: string
+              scopes:
+                description: |-
+                  Scopes selects which phases of the tools/call lifecycle are sent to
+                  the filter. At least one must be specified.
+                  - "Request":  invoked before the tools/call is forwarded to the backend.
+                  - "Response": invoked after the backend returns, before the response is
+                    written to the client.
+                items:
+                  description: MCPContentFilterScope selects a phase of the tools/call
+                    lifecycle.
+                  enum:
+                  - Request
+                  - Response
+                  type: string
+                maxItems: 2
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
+              shadowSampleRatePermille:
+                description: |-
+                  ShadowSampleRatePermille bounds the fraction of invocations
+                  actually evaluated when Mode is Shadow. It is expressed in
+                  permille (parts per thousand, 0..1000) so operators can set
+                  0.1% granularity on high-traffic backends without switching
+                  to floating point. A value of 1000 means every shadow-mode
+                  invocation is evaluated (default, preserves backward compat).
+                  A value of 0 means the filter is never invoked and every
+                  shadow-mode call records action=shadow_sampled_out.
+
+                  Sampling happens BEFORE the filter service is contacted, so
+                  values < 1000 provide a hard cost and latency budget: an
+                  operator running shadow mode against an expensive LLM-based
+                  filter can cap traffic at e.g. 10 permille (1 %) while still
+                  producing a statistically meaningful sample for
+                  false-positive / false-negative dashboards.
+
+                  Ignored when Mode is Enforce (enforcement always evaluates
+                  every call — sampling enforcement would leak content).
+
+                  Defaults to 1000.
+                format: int32
+                maximum: 1000
+                minimum: 0
+                type: integer
+              targetRefs:
+                description: "TargetRefs selects the MCPRoutes (and, optionally via
+                  sectionName, the\nspecific backend references on those routes) that
+                  this filter attaches\nto. At least one entry is required for the
+                  filter to have any effect.\n\nEach entry MUST reference an MCPRoute
+                  in the same namespace:\n\n\tgroup: aigateway.envoyproxy.io\n\tkind:
+                  \ MCPRoute\n\tname:  <MCPRoute name>\n\nOptionally carry\n\n\tsectionName:
+                  <backend name>\n\nto scope the filter to a single backend entry
+                  on that MCPRoute. When\nsectionName is omitted, the filter applies
+                  to every backend on the\ntargeted route."
+                items:
+                  description: |-
+                    LocalPolicyTargetReferenceWithSectionName identifies an API object to apply a
+                    direct policy to. This should be used as part of Policy resources that can
+                    target single resources. For more information on how this policy attachment
+                    mode works, and a sample Policy resource, refer to the policy attachment
+                    documentation for Gateway API.
+
+                    Note: This should only be used for direct policy attachment when references
+                    to SectionName are actually needed. In all other cases,
+                    LocalPolicyTargetReference should be used.
+                  properties:
+                    group:
+                      description: Group is the group of the target resource.
+                      maxLength: 253
+                      pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                    kind:
+                      description: Kind is kind of the target resource.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                      type: string
+                    name:
+                      description: Name is the name of the target resource.
+                      maxLength: 253
+                      minLength: 1
+                      type: string
+                    sectionName:
+                      description: |-
+                        SectionName is the name of a section within the target resource. When
+                        unspecified, this targetRef targets the entire resource. In the following
+                        resources, SectionName is interpreted as the following:
+
+                        * Gateway: Listener name
+                        * HTTPRoute: HTTPRouteRule name
+                        * Service: Port name
+
+                        If a SectionName is specified, but does not exist on the targeted object,
+                        the Policy must fail to attach, and the policy implementation should record
+                        a `ResolvedRefs` or similar Condition in the Policy's status.
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                  required:
+                  - group
+                  - kind
+                  - name
+                  type: object
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-validations:
+                - message: targetRefs must reference aigateway.envoyproxy.io/MCPRoute
+                  rule: self.all(ref, ref.group == 'aigateway.envoyproxy.io' && ref.kind
+                    == 'MCPRoute')
+              timeoutSeconds:
+                description: |-
+                  TimeoutSeconds is the per-invocation timeout applied when calling the
+                  filter service. If the filter does not respond before this deadline,
+                  FailurePolicy is applied.
+
+                  Defaults to 10 seconds. Must be between 1 and 120 inclusive.
+                format: int32
+                maximum: 120
+                minimum: 1
+                type: integer
+              url:
+                description: |-
+                  URL is the HTTP endpoint of the content filter service. Must use the
+                  http:// or https:// scheme. No other schemes are supported.
+                maxLength: 1024
+                minLength: 1
+                pattern: ^https?://.+$
+                type: string
+            required:
+            - scopes
+            - targetRefs
+            - url
+            type: object
+          status:
+            description: Status defines the status details of the MCPContentFilter.
+            properties:
+              conditions:
+                description: Conditions is the list of observed conditions for the
+                  MCPContentFilter.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

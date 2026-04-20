@@ -306,33 +306,55 @@ func (s *session) sendToBackendsFiltered(ctx context.Context, httpMethod string,
 		sessionID := cse.sessionID
 		go func() {
 			defer wg.Done()
-			backend, err := s.reqCtx.getBackendForRoute(s.route, backendName)
-			if err != nil {
-				logger.Error("failed to get backend for route",
-					slog.String("backend", backendName),
-					slog.String("session_id", string(sessionID)),
-					slog.String("error", err.Error()),
-				)
-				return
-			}
-			err = s.sendRequestPerBackend(ctx, backendMsgs, s.route, backend, cse, httpMethod, request)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
+			// L07: wrap the per-backend fan-out in safeGo so a panic
+			// in one backend's send path cannot take down the
+			// whole gateway process. The recovered error is logged
+			// with the same correlation keys used on the happy path
+			// so operators can find the offending stack via grep.
+			if err := safeGo("session backend fan-out", func() error {
+				backend, err := s.reqCtx.getBackendForRoute(s.route, backendName)
+				if err != nil {
+					logger.Error("failed to get backend for route",
+						slog.String("backend", backendName),
+						slog.String("session_id", string(sessionID)),
+						slog.String("error", err.Error()),
+					)
+					return nil
 				}
-				logger.Error("failed to collect messages from MCP backend",
+				err = s.sendRequestPerBackend(ctx, backendMsgs, s.route, backend, cse, httpMethod, request)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return nil
+					}
+					logger.Error("failed to collect messages from MCP backend",
+						slog.String("backend", backendName),
+						slog.String("session_id", string(sessionID)),
+						slog.String("error", err.Error()),
+					)
+				}
+				if span != nil {
+					span.RecordRouteToBackend(backendName, string(sessionID), false)
+				}
+				return nil
+			}); err != nil {
+				logger.Error("recovered panic in session backend fan-out",
 					slog.String("backend", backendName),
 					slog.String("session_id", string(sessionID)),
 					slog.String("error", err.Error()),
 				)
-			}
-			if span != nil {
-				span.RecordRouteToBackend(backendName, string(sessionID), false)
 			}
 		}()
 	}
 	go func() {
-		wg.Wait()
+		// L07: guard the channel-closer against panics too. A panic
+		// here (e.g. from wg misuse) would leave readers of
+		// backendMsgs blocked forever; safeGo turns that into a
+		// logged error and lets the defer ... recover() close the
+		// channel via the outer close(backendMsgs) below.
+		_ = safeGo("session backend channel closer", func() error {
+			wg.Wait()
+			return nil
+		})
 		close(backendMsgs)
 	}()
 

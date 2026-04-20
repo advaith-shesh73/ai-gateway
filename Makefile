@@ -295,9 +295,9 @@ build.%: ## Build a binary for the given command under the internal/cmd director
 		done; \
 	done
 
-# This builds the docker images for the controller, extproc and testupstream for the e2e tests.
+# This builds the docker images for the controller, extproc, and testupstream for the e2e tests.
 .PHONY: build-e2e
-build-e2e: ## Build the docker images for the controller, extproc and testupstream for the e2e tests.
+build-e2e: ## Build the docker images for the controller, extproc, and testupstream for the e2e tests.
 	@$(MAKE) docker-build.controller DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.extproc DOCKER_BUILD_ARGS="--load"
 	@$(MAKE) docker-build.testupstream CMD_PATH_PREFIX=tests/internal/testupstreamlib DOCKER_BUILD_ARGS="--load"

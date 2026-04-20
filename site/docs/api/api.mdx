@@ -23,6 +23,8 @@ API group.
 - [BackendSecurityPolicyList](#backendsecuritypolicylist)
 - [GatewayConfig](#gatewayconfig)
 - [GatewayConfigList](#gatewayconfiglist)
+- [MCPContentFilter](#mcpcontentfilter)
+- [MCPContentFilterList](#mcpcontentfilterlist)
 - [MCPRoute](#mcproute)
 - [MCPRouteList](#mcproutelist)
 - [QuotaPolicy](#quotapolicy)
@@ -387,6 +389,125 @@ GatewayConfigList contains a list of GatewayConfig.
 />
 
 
+#### MCPContentFilter
+
+
+
+**Appears in:**
+- [MCPContentFilterList](#mcpcontentfilterlist)
+
+MCPContentFilter is a standalone, top-level policy object that attaches a
+content filter to one or more MCPRoutes (optionally scoped to specific
+backend references) via targetRefs. It is the analogue of
+BackendSecurityPolicy for content filtering: one MCPContentFilter object
+can be authored by a platform/security team and attached to routes owned
+by separate application teams, without requiring edits to the MCPRoute
+spec itself.
+
+# Relationship to the inline form
+
+The inline form lives on [MCPRouteBackendRef.ContentFilter] and carries the
+same filter body ([MCPContentFilterConfig]) directly on the backend
+reference. Operators may use either form, but they are NOT additive: when a
+standalone MCPContentFilter's targetRefs selects a given (MCPRoute,
+backend) pair, the standalone value wins and the inline value on that
+backend reference is ignored. This is consistent with how
+BackendSecurityPolicy overrides inline auth on AIServiceBackend.
+
+The same conflict resolution applies across multiple standalone objects: at
+most one MCPContentFilter may target a given (MCPRoute, backend) pair. A
+second match is a configuration error and the backend's filter collapses to
+nil (plus a controller-emitted log) so traffic fails closed on policy
+ambiguity rather than silently picking a "winner".
+
+# Target granularity
+
+Each entry in spec.targetRefs must have
+
+	group: aigateway.envoyproxy.io
+	kind:  MCPRoute
+	name:  <MCPRoute name>
+
+and may optionally carry
+
+	sectionName: <backend name>
+
+to scope the filter to a single backend reference on the route. Omitting
+sectionName applies the filter to *every* backend on the targeted
+MCPRoute. Cross-namespace references are not supported; the
+MCPContentFilter object must live in the same namespace as the MCPRoute it
+targets.
+
+##### Fields
+
+<ApiField
+  name="apiVersion"
+  type="String"
+  required="true"
+  description="We are on version <code>aigateway.envoyproxy.io/v1alpha1</code> of the API."
+/>
+
+<ApiField
+  name="kind"
+  type="String"
+  required="true"
+  description="This is a <code>MCPContentFilter</code> resource"
+/>
+
+<ApiField
+  name="metadata"
+  type="[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.29/#objectmeta-v1-meta)"
+  required="true"
+  description="Refer to Kubernetes API documentation for fields of `metadata`."
+/><ApiField
+  name="spec"
+  type="[MCPContentFilterSpec](#mcpcontentfilterspec)"
+  required="true"
+  description="Spec defines the filter configuration and the set of MCPRoute/backend<br />targets this filter attaches to."
+/><ApiField
+  name="status"
+  type="[MCPContentFilterStatus](#mcpcontentfilterstatus)"
+  required="true"
+  description="Status defines the status details of the MCPContentFilter."
+/>
+
+
+#### MCPContentFilterList
+
+
+
+
+MCPContentFilterList contains a list of MCPContentFilter.
+
+##### Fields
+
+<ApiField
+  name="apiVersion"
+  type="String"
+  required="true"
+  description="We are on version <code>aigateway.envoyproxy.io/v1alpha1</code> of the API."
+/>
+
+<ApiField
+  name="kind"
+  type="String"
+  required="true"
+  description="This is a <code>MCPContentFilterList</code> resource"
+/>
+
+<ApiField
+  name="metadata"
+  type="[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.29/#listmeta-v1-meta)"
+  required="true"
+  description="Refer to Kubernetes API documentation for fields of `metadata`."
+/><ApiField
+  name="items"
+  type="[MCPContentFilter](#mcpcontentfilter) array"
+  required="true"
+  description=""
+/>
+
+
 #### MCPRoute
 
 
@@ -593,6 +714,12 @@ QuotaPolicyList contains a list of QuotaPolicy
 - [MCPAuthorizationTarget](#mcpauthorizationtarget)
 - [MCPBackendAPIKey](#mcpbackendapikey)
 - [MCPBackendSecurityPolicy](#mcpbackendsecuritypolicy)
+- [MCPContentFilterConfig](#mcpcontentfilterconfig)
+- [MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)
+- [MCPContentFilterMode](#mcpcontentfiltermode)
+- [MCPContentFilterScope](#mcpcontentfilterscope)
+- [MCPContentFilterSpec](#mcpcontentfilterspec)
+- [MCPContentFilterStatus](#mcpcontentfilterstatus)
 - [MCPRouteAuthorization](#mcprouteauthorization)
 - [MCPRouteAuthorizationRule](#mcprouteauthorizationrule)
 - [MCPRouteBackendRef](#mcproutebackendref)
@@ -1833,6 +1960,243 @@ MCPBackendSecurityPolicy defines the security policy for a sp
 />
 
 
+#### MCPContentFilterConfig
+
+
+
+**Appears in:**
+- [MCPContentFilterSpec](#mcpcontentfilterspec)
+- [MCPRouteBackendRef](#mcproutebackendref)
+
+MCPContentFilterConfig is the shared body of a content filter
+configuration. It is used both inline on [MCPRouteBackendRef.ContentFilter]
+and as the inlined payload of [MCPContentFilterSpec], so operators can move
+a filter between inline and standalone forms without rewriting fields.
+
+For each invocation that matches one of the configured Scopes, the gateway
+POSTs a JSON envelope to URL containing the JSON-RPC message and a subset
+of the client's HTTP headers (selected by ForwardHeaders). The service
+replies with an action of pass, redact, or reject. On redact, the
+replacement JSON-RPC message supplied by the filter is forwarded in place
+of the original. On reject, the gateway returns a JSON-RPC error to the
+client and does not contact the backend (request scope) or forward the
+response (response scope).
+
+##### Fields
+
+
+
+<ApiField
+  name="url"
+  type="string"
+  required="true"
+  description="URL is the HTTP endpoint of the content filter service. Must use the<br />http:// or https:// scheme. No other schemes are supported."
+/><ApiField
+  name="scopes"
+  type="[MCPContentFilterScope](#mcpcontentfilterscope) array"
+  required="true"
+  description="Scopes selects which phases of the tools/call lifecycle are sent to<br />the filter. At least one must be specified.<br />- `Request`:  invoked before the tools/call is forwarded to the backend.<br />- `Response`: invoked after the backend returns, before the response is<br />  written to the client."
+/><ApiField
+  name="timeoutSeconds"
+  type="integer"
+  required="false"
+  description="TimeoutSeconds is the per-invocation timeout applied when calling the<br />filter service. If the filter does not respond before this deadline,<br />FailurePolicy is applied.<br />Defaults to 10 seconds. Must be between 1 and 120 inclusive."
+/><ApiField
+  name="failurePolicy"
+  type="[MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)"
+  required="false"
+  description="FailurePolicy controls behaviour when the gateway cannot obtain a<br />definitive verdict from the filter service. This covers:<br />  - connection refused / TCP reset / TLS handshake failure;<br />  - filter service returns any non-2xx HTTP status;<br />  - response body is not valid JSON or the action field is not one of<br />    pass, redact, reject;<br />  - the filter call exceeds TimeoutSeconds (gateway cancels the<br />    request and treats it as failure).<br />A filter that responds cleanly with action=reject is NOT a failure —<br />it is a deliberate verdict and the gateway always honours it<br />regardless of FailurePolicy (see error code -32010 on the client).<br />- `PassThrough`: the original JSON-RPC message is used and the tool<br />  call continues. This is fail-open: the filter outage becomes<br />  invisible to end-users but the gateway does NOT get to inspect the<br />  body. Appropriate for filters whose role is best-effort redaction.<br />- `Fail`:        the gateway returns a JSON-RPC error to the client<br />  (code -32011) and does NOT forward the request/response. This is<br />  fail-closed. Appropriate for evaluation and compliance workloads<br />  where an unscanned response is worse than no response.<br />Every failure is observable regardless of policy: the gateway emits<br />X-Content-Filter-Status=failed-open or unavailable, increments<br />mcp_filter_status_total with the corresponding status label, and<br />logs the underlying transport/parse/timeout error. Operators should<br />page on sustained failed-open rates even when configured fail-open.<br />Defaults to `PassThrough`."
+/><ApiField
+  name="forwardHeaders"
+  type="string array"
+  required="false"
+  description="ForwardHeaders lists HTTP header names to copy from the client's<br />incoming request into the filter invocation. Header names are<br />case-insensitive. This enables tenant- or context-aware policy (for<br />example, forwarding an evaluation-run ticket ID or a tenant ID).<br />SECURITY: the filter service receives every header named here<br />verbatim. Treat each entry as an intentional trust-boundary<br />decision: the filter host, its logs, and any sidecar/network<br />observer between the gateway and filter can observe the value.<br />  - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,<br />    or any header carrying a bearer token, session identifier, or<br />    long-lived credential unless the filter is explicitly in-scope<br />    for handling those secrets.<br />  - Prefer opaque identifiers (request ID, tenant ID, evaluation<br />    ticket ID) over headers derived from end-user credentials.<br />  - If the filter runs in a different Kubernetes namespace or trust<br />    zone than the gateway, forwarding user-bearing headers widens<br />    the blast radius of a filter compromise.<br />When in doubt, omit the header."
+/><ApiField
+  name="mode"
+  type="[MCPContentFilterMode](#mcpcontentfiltermode)"
+  required="false"
+  description="Mode selects between Enforce (default) and Shadow. In Shadow mode<br />the gateway still invokes the filter service, records the<br />would-be verdict via X-Content-Filter-Status and<br />mcp_filter_decisions_total, and emits redaction audit events, but<br />always forwards the ORIGINAL body to the client (and backend on<br />Request scope). Use Shadow during pre-production rollout to<br />measure false-positive and false-negative rates on real traffic<br />without impacting users. Operators flip back to Enforce to<br />activate actual enforcement without a gateway restart.<br />Defaults to `Enforce`."
+/><ApiField
+  name="enabled"
+  type="boolean"
+  required="false"
+  description="Enabled toggles the filter for this backend without removing the<br />configuration. When set to false the gateway forwards the tool<br />call as if no content filter were configured for this backend and<br />reports X-Content-Filter-Status: disabled on the response.<br />Preserving the rest of the configuration lets operators<br />re-enable the filter (possibly with adjusted Mode or<br />FailurePolicy) via a single CRD update, without re-entering<br />URL, scopes, timeout, or headers.<br />Defaults to true. Use the process-wide kill switch<br />(MCPContentFilterPolicy.GlobalDisable, distributed via the<br />policy ConfigMap) to disable every filter in one step during<br />an incident."
+/><ApiField
+  name="shadowSampleRatePermille"
+  type="integer"
+  required="false"
+  description="ShadowSampleRatePermille bounds the fraction of invocations<br />actually evaluated when Mode is Shadow. It is expressed in<br />permille (parts per thousand, 0..1000) so operators can set<br />0.1% granularity on high-traffic backends without switching<br />to floating point. A value of 1000 means every shadow-mode<br />invocation is evaluated (default, preserves backward compat).<br />A value of 0 means the filter is never invoked and every<br />shadow-mode call records action=shadow_sampled_out.<br />Sampling happens BEFORE the filter service is contacted, so<br />values < 1000 provide a hard cost and latency budget: an<br />operator running shadow mode against an expensive LLM-based<br />filter can cap traffic at e.g. 10 permille (1 %) while still<br />producing a statistically meaningful sample for<br />false-positive / false-negative dashboards.<br />Ignored when Mode is Enforce (enforcement always evaluates<br />every call — sampling enforcement would leak content).<br />Defaults to 1000."
+/>
+
+
+#### MCPContentFilterFailurePolicy
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilterConfig](#mcpcontentfilterconfig)
+- [MCPContentFilterSpec](#mcpcontentfilterspec)
+
+MCPContentFilterFailurePolicy controls how the gateway reacts when the
+filter service is unavailable or errors.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="PassThrough"
+  type="enum"
+  required="false"
+  description="MCPContentFilterFailurePolicyPassThrough forwards the unmodified<br />request or response when the filter service cannot be consulted.<br />This is the default and is fail-open.<br />"
+/><ApiField
+  name="Fail"
+  type="enum"
+  required="false"
+  description="MCPContentFilterFailurePolicyFail causes the tool call to fail with a<br />JSON-RPC error when the filter service cannot be consulted. Use this<br />when serving unscanned content is worse than failing the call.<br />"
+/>
+#### MCPContentFilterMode
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilterConfig](#mcpcontentfilterconfig)
+- [MCPContentFilterSpec](#mcpcontentfilterspec)
+
+MCPContentFilterMode selects between enforcement and shadow evaluation.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="Enforce"
+  type="enum"
+  required="false"
+  description="MCPContentFilterModeEnforce applies the filter's verdict to the<br />client-visible response: on redact the rewritten body is forwarded,<br />on reject a JSON-RPC error is returned. This is the default.<br />"
+/><ApiField
+  name="Shadow"
+  type="enum"
+  required="false"
+  description="MCPContentFilterModeShadow invokes the filter and records the<br />verdict (X-Content-Filter-Status header, mcp_filter_decisions_total<br />counter with action=shadow_would_*, redaction audit events) but<br />forwards the ORIGINAL body to the client. Use Shadow mode for<br />pre-production evaluation: operators can measure what WOULD be<br />redacted or rejected on real traffic before committing to<br />enforcement. Shadow mode never surfaces filter errors as<br />client-visible failures — a would-be reject on a fail-closed<br />policy still forwards the original body, and fail-open<br />behaviour is indistinguishable from a successful would-be pass.<br />"
+/>
+#### MCPContentFilterScope
+
+**Underlying type:** string
+
+**Appears in:**
+- [MCPContentFilterConfig](#mcpcontentfilterconfig)
+- [MCPContentFilterSpec](#mcpcontentfilterspec)
+
+MCPContentFilterScope selects a phase of the tools/call lifecycle.
+
+
+
+##### Possible Values
+
+<ApiField
+  name="Request"
+  type="enum"
+  required="false"
+  description="MCPContentFilterScopeRequest invokes the filter before forwarding the<br />tools/call request to the backend.<br />"
+/><ApiField
+  name="Response"
+  type="enum"
+  required="false"
+  description="MCPContentFilterScopeResponse invokes the filter after the backend<br />responds, before the response is written to the client.<br />"
+/>
+#### MCPContentFilterSpec
+
+
+
+**Appears in:**
+- [MCPContentFilter](#mcpcontentfilter)
+
+MCPContentFilterSpec defines the desired state of a standalone
+MCPContentFilter. It combines the attachment surface (TargetRefs) with the
+filter body ([MCPContentFilterConfig], inlined).
+
+##### Fields
+
+
+
+<ApiField
+  name="targetRefs"
+  type="[LocalPolicyTargetReferenceWithSectionName](https://gateway-api.sigs.k8s.io/reference/spec/#gateway.networking.k8s.io/v1alpha2.LocalPolicyTargetReferenceWithSectionName) array"
+  required="true"
+  description="TargetRefs selects the MCPRoutes (and, optionally via sectionName, the<br />specific backend references on those routes) that this filter attaches<br />to. At least one entry is required for the filter to have any effect.<br />Each entry MUST reference an MCPRoute in the same namespace:<br />	group: aigateway.envoyproxy.io<br />	kind:  MCPRoute<br />	name:  <MCPRoute name><br />Optionally carry<br />	sectionName: <backend name><br />to scope the filter to a single backend entry on that MCPRoute. When<br />sectionName is omitted, the filter applies to every backend on the<br />targeted route."
+/><ApiField
+  name="url"
+  type="string"
+  required="true"
+  description="URL is the HTTP endpoint of the content filter service. Must use the<br />http:// or https:// scheme. No other schemes are supported."
+/><ApiField
+  name="scopes"
+  type="[MCPContentFilterScope](#mcpcontentfilterscope) array"
+  required="true"
+  description="Scopes selects which phases of the tools/call lifecycle are sent to<br />the filter. At least one must be specified.<br />- `Request`:  invoked before the tools/call is forwarded to the backend.<br />- `Response`: invoked after the backend returns, before the response is<br />  written to the client."
+/><ApiField
+  name="timeoutSeconds"
+  type="integer"
+  required="false"
+  description="TimeoutSeconds is the per-invocation timeout applied when calling the<br />filter service. If the filter does not respond before this deadline,<br />FailurePolicy is applied.<br />Defaults to 10 seconds. Must be between 1 and 120 inclusive."
+/><ApiField
+  name="failurePolicy"
+  type="[MCPContentFilterFailurePolicy](#mcpcontentfilterfailurepolicy)"
+  required="false"
+  description="FailurePolicy controls behaviour when the gateway cannot obtain a<br />definitive verdict from the filter service. This covers:<br />  - connection refused / TCP reset / TLS handshake failure;<br />  - filter service returns any non-2xx HTTP status;<br />  - response body is not valid JSON or the action field is not one of<br />    pass, redact, reject;<br />  - the filter call exceeds TimeoutSeconds (gateway cancels the<br />    request and treats it as failure).<br />A filter that responds cleanly with action=reject is NOT a failure —<br />it is a deliberate verdict and the gateway always honours it<br />regardless of FailurePolicy (see error code -32010 on the client).<br />- `PassThrough`: the original JSON-RPC message is used and the tool<br />  call continues. This is fail-open: the filter outage becomes<br />  invisible to end-users but the gateway does NOT get to inspect the<br />  body. Appropriate for filters whose role is best-effort redaction.<br />- `Fail`:        the gateway returns a JSON-RPC error to the client<br />  (code -32011) and does NOT forward the request/response. This is<br />  fail-closed. Appropriate for evaluation and compliance workloads<br />  where an unscanned response is worse than no response.<br />Every failure is observable regardless of policy: the gateway emits<br />X-Content-Filter-Status=failed-open or unavailable, increments<br />mcp_filter_status_total with the corresponding status label, and<br />logs the underlying transport/parse/timeout error. Operators should<br />page on sustained failed-open rates even when configured fail-open.<br />Defaults to `PassThrough`."
+/><ApiField
+  name="forwardHeaders"
+  type="string array"
+  required="false"
+  description="ForwardHeaders lists HTTP header names to copy from the client's<br />incoming request into the filter invocation. Header names are<br />case-insensitive. This enables tenant- or context-aware policy (for<br />example, forwarding an evaluation-run ticket ID or a tenant ID).<br />SECURITY: the filter service receives every header named here<br />verbatim. Treat each entry as an intentional trust-boundary<br />decision: the filter host, its logs, and any sidecar/network<br />observer between the gateway and filter can observe the value.<br />  - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,<br />    or any header carrying a bearer token, session identifier, or<br />    long-lived credential unless the filter is explicitly in-scope<br />    for handling those secrets.<br />  - Prefer opaque identifiers (request ID, tenant ID, evaluation<br />    ticket ID) over headers derived from end-user credentials.<br />  - If the filter runs in a different Kubernetes namespace or trust<br />    zone than the gateway, forwarding user-bearing headers widens<br />    the blast radius of a filter compromise.<br />When in doubt, omit the header."
+/><ApiField
+  name="mode"
+  type="[MCPContentFilterMode](#mcpcontentfiltermode)"
+  required="false"
+  description="Mode selects between Enforce (default) and Shadow. In Shadow mode<br />the gateway still invokes the filter service, records the<br />would-be verdict via X-Content-Filter-Status and<br />mcp_filter_decisions_total, and emits redaction audit events, but<br />always forwards the ORIGINAL body to the client (and backend on<br />Request scope). Use Shadow during pre-production rollout to<br />measure false-positive and false-negative rates on real traffic<br />without impacting users. Operators flip back to Enforce to<br />activate actual enforcement without a gateway restart.<br />Defaults to `Enforce`."
+/><ApiField
+  name="enabled"
+  type="boolean"
+  required="false"
+  description="Enabled toggles the filter for this backend without removing the<br />configuration. When set to false the gateway forwards the tool<br />call as if no content filter were configured for this backend and<br />reports X-Content-Filter-Status: disabled on the response.<br />Preserving the rest of the configuration lets operators<br />re-enable the filter (possibly with adjusted Mode or<br />FailurePolicy) via a single CRD update, without re-entering<br />URL, scopes, timeout, or headers.<br />Defaults to true. Use the process-wide kill switch<br />(MCPContentFilterPolicy.GlobalDisable, distributed via the<br />policy ConfigMap) to disable every filter in one step during<br />an incident."
+/><ApiField
+  name="shadowSampleRatePermille"
+  type="integer"
+  required="false"
+  description="ShadowSampleRatePermille bounds the fraction of invocations<br />actually evaluated when Mode is Shadow. It is expressed in<br />permille (parts per thousand, 0..1000) so operators can set<br />0.1% granularity on high-traffic backends without switching<br />to floating point. A value of 1000 means every shadow-mode<br />invocation is evaluated (default, preserves backward compat).<br />A value of 0 means the filter is never invoked and every<br />shadow-mode call records action=shadow_sampled_out.<br />Sampling happens BEFORE the filter service is contacted, so<br />values < 1000 provide a hard cost and latency budget: an<br />operator running shadow mode against an expensive LLM-based<br />filter can cap traffic at e.g. 10 permille (1 %) while still<br />producing a statistically meaningful sample for<br />false-positive / false-negative dashboards.<br />Ignored when Mode is Enforce (enforcement always evaluates<br />every call — sampling enforcement would leak content).<br />Defaults to 1000."
+/>
+
+
+#### MCPContentFilterStatus
+
+
+
+**Appears in:**
+- [MCPContentFilter](#mcpcontentfilter)
+
+MCPContentFilterStatus defines observed state for a standalone
+MCPContentFilter. Conditions follow the Gateway API policy conventions:
+
+  - Accepted:   the controller accepted the spec (references resolve,
+    target type/group is correct, URL is a valid http(s) URI).
+  - Conflicted: another MCPContentFilter already targets one of the
+    same (MCPRoute, backend) pairs; this object's effect is suppressed
+    on the overlapping targets. The message lists the conflicting
+    targets for operator triage.
+
+##### Fields
+
+
+
+<ApiField
+  name="conditions"
+  type="[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.29/#condition-v1-meta) array"
+  required="false"
+  description="Conditions is the list of observed conditions for the MCPContentFilter."
+/>
+
+
 #### MCPRouteAuthorization
 
 
@@ -1953,6 +2317,11 @@ MCPRouteBackendRef wraps a EG's BackendObjectReference to reference an MCP serve
   type="[MCPBackendSecurityPolicy](#mcpbackendsecuritypolicy)"
   required="false"
   description="SecurityPolicy is the security policy to apply to this MCP server."
+/><ApiField
+  name="contentFilter"
+  type="[MCPContentFilterConfig](#mcpcontentfilterconfig)"
+  required="false"
+  description="ContentFilter configures an optional external HTTP service that inspects<br />and may rewrite `tools/call` payloads for this backend before they are<br />forwarded to the MCP server (request scope) and/or after the response<br />is returned (response scope).<br />Typical uses are PII scrubbing and evaluation-mode source exclusion,<br />where the gateway needs to rewrite request parameters or response<br />content according to an external policy service.<br />This field is the *inline* form and carries the filter body directly on<br />the backend reference. Operators may alternatively author a standalone<br />top-level MCPContentFilter object whose spec.targetRefs selects this<br />MCPRoute (optionally scoped to this backend by sectionName). When a<br />standalone MCPContentFilter targets this backend, it wins and the inline<br />value here is ignored. See type MCPContentFilter for the standalone form."
 />
 
 

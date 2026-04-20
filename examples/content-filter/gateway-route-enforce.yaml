@@ -1,0 +1,90 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# ENFORCE-MODE production example.
+#
+# This MCPRoute runs the content-filter service in enforce mode: for
+# every response-scope invocation of the filtered tools, the filter's
+# verdict is APPLIED to the client-visible response. A "redact" verdict
+# swaps the body; a "reject" verdict turns into a JSON-RPC error.
+#
+# Use this only AFTER:
+#   1. The shadow-mode dashboards have been clean for >=1 week.
+#   2. The content-filter service has been hardened (replicas scaled
+#      to absorb peak traffic, LLM SLA verified).
+#   3. Your incident response playbook has the `globalDisable: true`
+#      knob documented as the immediate-rollback path.
+#
+# Notable differences vs gateway-route-shadow.yaml:
+#   - `mode: Enforce` (actually applies the verdict)
+#   - `failurePolicy: Fail` (evaluation workloads must NEVER serve
+#     unscanned content; if the filter is unreachable, fail the tool
+#     call so the caller retries rather than silently leaking data)
+#   - `shadowSampleRatePermille` is absent (enforce mode ignores it;
+#     sampling enforcement would leak content intermittently)
+
+---
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: jira-evaluation-filter
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+    content-filter.rollout: enforce
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  backendRefs:
+    - name: jira-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+      contentFilter:
+        url: http://content-filter.content-filter.svc.cluster.local:80/filter
+        scopes:
+          - Response
+        # Fail-closed: evaluation runs must never see unscanned data.
+        failurePolicy: Fail
+        timeoutSeconds: 65
+        # Actually apply the verdict.
+        mode: Enforce
+        # Per-backend kill switch. Set to false to revert to
+        # unfiltered traffic for this backend without editing the
+        # rest of the spec. For cluster-wide immediate rollback,
+        # flip `globalDisable: true` on the MCPContentFilterPolicy
+        # ConfigMap (see global-kill-switch.yaml).
+        enabled: true
+        forwardHeaders:
+          - "Authorization"
+          - "X-Eval-Ticket-Id"
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: jira-mcp
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: jira-mcp.example.com
+        port: 443
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: jira-mcp-tls
+  namespace: default
+spec:
+  targetRefs:
+    - group: "gateway.envoyproxy.io"
+      kind: Backend
+      name: jira-mcp
+  validation:
+    wellKnownCACertificates: "System"
+    hostname: jira-mcp.example.com

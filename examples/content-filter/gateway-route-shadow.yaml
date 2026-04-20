@@ -1,0 +1,113 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# SHADOW-MODE rollout example.
+#
+# This MCPRoute runs the content-filter service in shadow mode: for
+# each response-scope invocation of `mcp_atlassian_getJiraIssue` the
+# gateway calls the filter, records what it WOULD have done via the
+# mcp_filter_decisions_total metric and the shadow-audit log, and
+# then ALWAYS forwards the ORIGINAL response to the caller unchanged.
+#
+# Use this during rollout to:
+#   1. Measure redaction rate under real traffic.
+#   2. Build confidence the filter does not false-positive on business
+#      legitimate tool calls.
+#   3. Size budgets — shadow mode consumes LLM quota, so start with a
+#      modest sample rate and ramp.
+#
+# Switch to enforce mode only after the shadow-mode dashboards are
+# clean (no unexpected would-reject spikes, no regressions in LLM
+# latency). See gateway-route-enforce.yaml for the enforce-mode flip.
+#
+# Sampling:
+#   shadowSampleRatePermille: 100  ==  10 % of eligible calls hit the
+#   filter. Dial up to 1000 (100 %) once confident; dial down to 1
+#   (0.1 %) during incidents that spike traffic unexpectedly.
+
+---
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: jira-evaluation-filter
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: ai-gateway
+    content-filter.rollout: shadow
+spec:
+  parentRefs:
+    - name: aigw-run
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  path: "/mcp"
+  backendRefs:
+    - name: jira-mcp
+      kind: Backend
+      group: gateway.envoyproxy.io
+      path: "/mcp"
+      # ContentFilter: the PR-95-ported eval policy running in shadow
+      # mode. For each `tools/call` RESPONSE the gateway POSTs the
+      # envelope to http://content-filter.content-filter:80/filter; the
+      # verdict is recorded but NEVER applied to the traffic.
+      contentFilter:
+        url: http://content-filter.content-filter.svc.cluster.local:80/filter
+        scopes:
+          - Response
+        # Failure mode is pass-through during shadow rollout: a
+        # filter outage must not block traffic while we are still
+        # measuring. (Enforce mode should flip this to Fail — see
+        # gateway-route-enforce.yaml.)
+        failurePolicy: PassThrough
+        timeoutSeconds: 65
+        # Shadow mode: never applies the verdict. Ideal during
+        # rollout; combine with the sample rate below to throttle
+        # LLM cost.
+        mode: Shadow
+        # 10 % of eligible calls hit the filter. The remaining 90 %
+        # short-circuit with action=shadow_sampled_out so operators
+        # can size budgets under real traffic volumes. Values are in
+        # permille (parts per thousand), not percent:
+        #   1    =  0.1 % (incident throttle)
+        #   100  = 10.0 % (typical rollout default)
+        #   1000 = 100.0 % (full shadow traffic before enforce cut)
+        shadowSampleRatePermille: 100
+        # Per-backend kill switch. Flipping this to false stops the
+        # filter entirely WITHOUT editing the route (useful for
+        # operators who only hold per-namespace permission). For a
+        # cluster-wide kill switch, set `globalDisable: true` on the
+        # MCPContentFilterPolicy ConfigMap instead.
+        enabled: true
+        # Forward the Authorization and X-Eval-Ticket-Id headers so
+        # the filter can (a) call the LLM with the caller's bearer
+        # token (if relevant) and (b) pick up a per-call ticket
+        # override for evaluation runs. Other headers are stripped.
+        forwardHeaders:
+          - "Authorization"
+          - "X-Eval-Ticket-Id"
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: jira-mcp
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: jira-mcp.example.com
+        port: 443
+---
+apiVersion: gateway.networking.k8s.io/v1alpha3
+kind: BackendTLSPolicy
+metadata:
+  name: jira-mcp-tls
+  namespace: default
+spec:
+  targetRefs:
+    - group: "gateway.envoyproxy.io"
+      kind: Backend
+      name: jira-mcp
+  validation:
+    wellKnownCACertificates: "System"
+    hostname: jira-mcp.example.com

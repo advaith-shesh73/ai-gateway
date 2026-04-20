@@ -43,7 +43,98 @@ type MCPBackend struct {
 
 	// ToolSelector filters the tools exposed by this backend. If not set, all tools are exposed.
 	ToolSelector *MCPToolSelector `json:"toolSelector,omitempty"`
+
+	// ContentFilter configures an external HTTP service that inspects and may
+	// rewrite tools/call payloads for this backend. Nil means no content
+	// filtering is applied. See MCPContentFilter for semantics.
+	ContentFilter *MCPContentFilter `json:"contentFilter,omitempty"`
 }
+
+// MCPContentFilter is the runtime representation of an external HTTP content
+// filter for a single MCP backend. It mirrors
+// [aigv1a1.MCPContentFilter] with primitive types only so it can be
+// serialized into the proxy config file.
+type MCPContentFilter struct {
+	// URL is the HTTP(S) endpoint of the content filter service. Must include
+	// a scheme (http:// or https://).
+	URL string `json:"url"`
+
+	// Scopes selects the phases at which the filter is invoked. Valid
+	// members are "Request" and "Response". At least one is required.
+	Scopes []MCPContentFilterScope `json:"scopes"`
+
+	// TimeoutSeconds is the per-invocation timeout for the filter HTTP call.
+	// A value of 0 indicates that the default should be used.
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// FailurePolicy controls behaviour when the filter cannot be consulted.
+	// An empty value indicates that the default (PassThrough) should be used.
+	FailurePolicy MCPContentFilterFailurePolicy `json:"failurePolicy,omitempty"`
+
+	// ForwardHeaders is the case-insensitive list of client HTTP headers
+	// forwarded into each filter invocation.
+	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
+
+	// Mode selects enforcement vs. shadow evaluation. An empty value
+	// is treated as Enforce (the default) by the runtime. See
+	// [aigv1a1.MCPContentFilterMode] for the full contract.
+	Mode MCPContentFilterMode `json:"mode,omitempty"`
+
+	// Enabled toggles the filter for this backend without removing the
+	// configuration. A nil pointer is treated as enabled=true by the
+	// runtime (for backwards compatibility with configs that do not
+	// carry the field). Setting the pointer to false short-circuits
+	// every Request/Response-scope invocation for this backend and
+	// reports X-Content-Filter-Status: disabled. Global overrides
+	// live on MCPContentFilterPolicy.GlobalDisable.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// ShadowSampleRatePermille bounds shadow-mode invocations in
+	// permille (parts per thousand, 0..1000). Zero values are
+	// treated as 1000 (fully sampled) by the runtime so existing
+	// configs that do not carry the field keep their semantics.
+	// Values outside the range are clamped at validation time.
+	// Ignored when Mode is not Shadow.
+	ShadowSampleRatePermille int32 `json:"shadowSampleRatePermille,omitempty"`
+}
+
+// MCPContentFilterScope is the runtime mirror of
+// [aigv1a1.MCPContentFilterScope].
+type MCPContentFilterScope string
+
+const (
+	// MCPContentFilterScopeRequest invokes the filter before the backend call.
+	MCPContentFilterScopeRequest MCPContentFilterScope = "Request"
+	// MCPContentFilterScopeResponse invokes the filter after the backend call.
+	MCPContentFilterScopeResponse MCPContentFilterScope = "Response"
+)
+
+// MCPContentFilterFailurePolicy is the runtime mirror of
+// [aigv1a1.MCPContentFilterFailurePolicy].
+type MCPContentFilterFailurePolicy string
+
+const (
+	// MCPContentFilterFailurePolicyPassThrough forwards unmodified payloads
+	// when the filter cannot be consulted.
+	MCPContentFilterFailurePolicyPassThrough MCPContentFilterFailurePolicy = "PassThrough"
+	// MCPContentFilterFailurePolicyFail aborts the tool call when the filter
+	// cannot be consulted.
+	MCPContentFilterFailurePolicyFail MCPContentFilterFailurePolicy = "Fail"
+)
+
+// MCPContentFilterMode is the runtime mirror of
+// [aigv1a1.MCPContentFilterMode].
+type MCPContentFilterMode string
+
+const (
+	// MCPContentFilterModeEnforce applies the filter verdict to the
+	// client-visible response. Default when the field is empty.
+	MCPContentFilterModeEnforce MCPContentFilterMode = "Enforce"
+	// MCPContentFilterModeShadow runs the filter pipeline but always
+	// forwards the ORIGINAL body. See [aigv1a1.MCPContentFilterMode]
+	// for the full contract.
+	MCPContentFilterModeShadow MCPContentFilterMode = "Shadow"
+)
 
 // MCPBackendName is the name of the MCP backend.
 type MCPBackendName = string

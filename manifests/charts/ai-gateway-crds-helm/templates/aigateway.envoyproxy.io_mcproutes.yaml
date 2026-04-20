@@ -66,6 +66,184 @@ spec:
                   description: MCPRouteBackendRef wraps a EG's BackendObjectReference
                     to reference an MCP server.
                   properties:
+                    contentFilter:
+                      description: |-
+                        ContentFilter configures an optional external HTTP service that inspects
+                        and may rewrite "tools/call" payloads for this backend before they are
+                        forwarded to the MCP server (request scope) and/or after the response
+                        is returned (response scope).
+
+                        Typical uses are PII scrubbing and evaluation-mode source exclusion,
+                        where the gateway needs to rewrite request parameters or response
+                        content according to an external policy service.
+
+                        This field is the *inline* form and carries the filter body directly on
+                        the backend reference. Operators may alternatively author a standalone
+                        top-level MCPContentFilter object whose spec.targetRefs selects this
+                        MCPRoute (optionally scoped to this backend by sectionName). When a
+                        standalone MCPContentFilter targets this backend, it wins and the inline
+                        value here is ignored. See type MCPContentFilter for the standalone form.
+                      properties:
+                        enabled:
+                          description: |-
+                            Enabled toggles the filter for this backend without removing the
+                            configuration. When set to false the gateway forwards the tool
+                            call as if no content filter were configured for this backend and
+                            reports X-Content-Filter-Status: disabled on the response.
+                            Preserving the rest of the configuration lets operators
+                            re-enable the filter (possibly with adjusted Mode or
+                            FailurePolicy) via a single CRD update, without re-entering
+                            URL, scopes, timeout, or headers.
+
+                            Defaults to true. Use the process-wide kill switch
+                            (MCPContentFilterPolicy.GlobalDisable, distributed via the
+                            policy ConfigMap) to disable every filter in one step during
+                            an incident.
+                          type: boolean
+                        failurePolicy:
+                          description: |-
+                            FailurePolicy controls behaviour when the gateway cannot obtain a
+                            definitive verdict from the filter service. This covers:
+                              - connection refused / TCP reset / TLS handshake failure;
+                              - filter service returns any non-2xx HTTP status;
+                              - response body is not valid JSON or the action field is not one of
+                                pass, redact, reject;
+                              - the filter call exceeds TimeoutSeconds (gateway cancels the
+                                request and treats it as failure).
+
+                            A filter that responds cleanly with action=reject is NOT a failure —
+                            it is a deliberate verdict and the gateway always honours it
+                            regardless of FailurePolicy (see error code -32010 on the client).
+
+                            - "PassThrough": the original JSON-RPC message is used and the tool
+                              call continues. This is fail-open: the filter outage becomes
+                              invisible to end-users but the gateway does NOT get to inspect the
+                              body. Appropriate for filters whose role is best-effort redaction.
+                            - "Fail":        the gateway returns a JSON-RPC error to the client
+                              (code -32011) and does NOT forward the request/response. This is
+                              fail-closed. Appropriate for evaluation and compliance workloads
+                              where an unscanned response is worse than no response.
+
+                            Every failure is observable regardless of policy: the gateway emits
+                            X-Content-Filter-Status=failed-open or unavailable, increments
+                            mcp_filter_status_total with the corresponding status label, and
+                            logs the underlying transport/parse/timeout error. Operators should
+                            page on sustained failed-open rates even when configured fail-open.
+
+                            Defaults to "PassThrough".
+                          enum:
+                          - PassThrough
+                          - Fail
+                          type: string
+                        forwardHeaders:
+                          description: |-
+                            ForwardHeaders lists HTTP header names to copy from the client's
+                            incoming request into the filter invocation. Header names are
+                            case-insensitive. This enables tenant- or context-aware policy (for
+                            example, forwarding an evaluation-run ticket ID or a tenant ID).
+
+                            SECURITY: the filter service receives every header named here
+                            verbatim. Treat each entry as an intentional trust-boundary
+                            decision: the filter host, its logs, and any sidecar/network
+                            observer between the gateway and filter can observe the value.
+                              - NEVER list Authorization, Cookie, Set-Cookie, Proxy-Authorization,
+                                or any header carrying a bearer token, session identifier, or
+                                long-lived credential unless the filter is explicitly in-scope
+                                for handling those secrets.
+                              - Prefer opaque identifiers (request ID, tenant ID, evaluation
+                                ticket ID) over headers derived from end-user credentials.
+                              - If the filter runs in a different Kubernetes namespace or trust
+                                zone than the gateway, forwarding user-bearing headers widens
+                                the blast radius of a filter compromise.
+                            When in doubt, omit the header.
+                          items:
+                            type: string
+                          maxItems: 16
+                          type: array
+                        mode:
+                          description: |-
+                            Mode selects between Enforce (default) and Shadow. In Shadow mode
+                            the gateway still invokes the filter service, records the
+                            would-be verdict via X-Content-Filter-Status and
+                            mcp_filter_decisions_total, and emits redaction audit events, but
+                            always forwards the ORIGINAL body to the client (and backend on
+                            Request scope). Use Shadow during pre-production rollout to
+                            measure false-positive and false-negative rates on real traffic
+                            without impacting users. Operators flip back to Enforce to
+                            activate actual enforcement without a gateway restart.
+
+                            Defaults to "Enforce".
+                          enum:
+                          - Enforce
+                          - Shadow
+                          type: string
+                        scopes:
+                          description: |-
+                            Scopes selects which phases of the tools/call lifecycle are sent to
+                            the filter. At least one must be specified.
+                            - "Request":  invoked before the tools/call is forwarded to the backend.
+                            - "Response": invoked after the backend returns, before the response is
+                              written to the client.
+                          items:
+                            description: MCPContentFilterScope selects a phase of
+                              the tools/call lifecycle.
+                            enum:
+                            - Request
+                            - Response
+                            type: string
+                          maxItems: 2
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
+                        shadowSampleRatePermille:
+                          description: |-
+                            ShadowSampleRatePermille bounds the fraction of invocations
+                            actually evaluated when Mode is Shadow. It is expressed in
+                            permille (parts per thousand, 0..1000) so operators can set
+                            0.1% granularity on high-traffic backends without switching
+                            to floating point. A value of 1000 means every shadow-mode
+                            invocation is evaluated (default, preserves backward compat).
+                            A value of 0 means the filter is never invoked and every
+                            shadow-mode call records action=shadow_sampled_out.
+
+                            Sampling happens BEFORE the filter service is contacted, so
+                            values < 1000 provide a hard cost and latency budget: an
+                            operator running shadow mode against an expensive LLM-based
+                            filter can cap traffic at e.g. 10 permille (1 %) while still
+                            producing a statistically meaningful sample for
+                            false-positive / false-negative dashboards.
+
+                            Ignored when Mode is Enforce (enforcement always evaluates
+                            every call — sampling enforcement would leak content).
+
+                            Defaults to 1000.
+                          format: int32
+                          maximum: 1000
+                          minimum: 0
+                          type: integer
+                        timeoutSeconds:
+                          description: |-
+                            TimeoutSeconds is the per-invocation timeout applied when calling the
+                            filter service. If the filter does not respond before this deadline,
+                            FailurePolicy is applied.
+
+                            Defaults to 10 seconds. Must be between 1 and 120 inclusive.
+                          format: int32
+                          maximum: 120
+                          minimum: 1
+                          type: integer
+                        url:
+                          description: |-
+                            URL is the HTTP endpoint of the content filter service. Must use the
+                            http:// or https:// scheme. No other schemes are supported.
+                          maxLength: 1024
+                          minLength: 1
+                          pattern: ^https?://.+$
+                          type: string
+                      required:
+                      - scopes
+                      - url
+                      type: object
                     group:
                       default: ""
                       description: |-
