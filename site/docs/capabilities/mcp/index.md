@@ -551,7 +551,7 @@ both backend-scoped and route-wide variants
 (`gateway-route-standalone.yaml`), and the `MCPContentFilterPolicy`
 cluster-wide kill-switch ConfigMap (`global-kill-switch.yaml`). The
 reference filter service itself (LLM-powered evaluation-mode redactor)
-lives with `panacea-agent` under `services/aigw-content-filter-dispatcher/`.
+lives with `panacea-agent` under `services/aigw-content-filter/`.
 
 #### Wire Protocol
 

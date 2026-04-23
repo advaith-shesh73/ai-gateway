@@ -476,7 +476,10 @@ func TestApplyOnResponse_EnforceMode_IgnoresSamplingRate(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:      contentFilterActionPass,
+			RanPolicies: []string{"test-policy"},
+		})
 	}))
 	defer srv.Close()
 

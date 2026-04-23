@@ -56,7 +56,7 @@ spec:
       kind: MCPRoute
       name: jira-evaluation-route
       sectionName: jira-mcp
-  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
   scopes:
     - Response
   failurePolicy: Fail
@@ -96,7 +96,7 @@ spec:
     - group: aigateway.envoyproxy.io
       kind: MCPRoute
       name: fleet-shadow-route
-  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
   scopes:
     - Response
   failurePolicy: PassThrough

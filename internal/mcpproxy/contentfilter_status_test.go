@@ -56,8 +56,25 @@ func newStatusTestMetrics(t *testing.T) *PrometheusMetrics {
 }
 
 // passFilterServer returns an httptest server that always responds
-// with a pass verdict.
+// with an affirmative pass verdict (i.e. at least one policy ran and
+// judged the body clean). Populates RanPolicies so status maps to
+// [FilterStatusPass] rather than [FilterStatusIdle].
 func passFilterServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:      contentFilterActionPass,
+			RanPolicies: []string{"test-policy"},
+		})
+	}))
+}
+
+// idleFilterServer returns an httptest server that responds with a
+// pass verdict but an empty RanPolicies -- the wire signal for
+// [FilterStatusIdle]. Exists separately from [passFilterServer] so
+// tests can assert the idle path without coupling to the pass-helper
+// payload.
+func idleFilterServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
@@ -139,6 +156,29 @@ func TestApplyContentFilterOnRequestWithStatus_PassReportsPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, req, got, "pass with identical body returns the original pointer")
 	require.Equal(t, FilterStatusPass, status)
+}
+
+func TestApplyContentFilterOnRequestWithStatus_IdleReportsIdle(t *testing.T) {
+	// A pass verdict with empty ran_policies means the filter was
+	// wired but judged nothing -- operators see this as "idle" on
+	// dashboards, which is semantically distinct from an affirmative
+	// pass verdict.
+	srv := idleFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
+
+	req := &jsonrpc.Request{
+		ID:     makeID(t, float64(1)),
+		Method: "tools/call",
+		Params: mustJSON(t, map[string]any{"name": "lookup"}),
+	}
+
+	got, status, err := applyContentFilterOnRequestWithStatus(
+		context.Background(), &mcpLoggerShim{}, &http.Client{}, cf,
+		"r", "b", "lookup", req, http.Header{})
+	require.NoError(t, err)
+	require.Same(t, req, got, "idle (body unchanged) returns the original pointer")
+	require.Equal(t, FilterStatusIdle, status)
 }
 
 func TestApplyContentFilterOnRequestWithStatus_RedactReportsRedact(t *testing.T) {
@@ -251,6 +291,20 @@ func TestApplyContentFilterOnResponseWithStatus_PassReportsPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, resp, got)
 	require.Equal(t, FilterStatusPass, status)
+}
+
+func TestApplyContentFilterOnResponseWithStatus_IdleReportsIdle(t *testing.T) {
+	srv := idleFilterServer(t)
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
+
+	resp := &jsonrpc.Response{ID: makeID(t, float64(1)), Result: mustJSON(t, map[string]any{"ok": true})}
+	got, status, err := applyContentFilterOnResponseWithStatus(
+		context.Background(), &mcpLoggerShim{}, &http.Client{}, cf,
+		"r", "b", "lookup", &jsonrpc.Request{Method: "tools/call"}, resp, http.Header{})
+	require.NoError(t, err)
+	require.Same(t, resp, got)
+	require.Equal(t, FilterStatusIdle, status)
 }
 
 func TestApplyContentFilterOnResponseWithStatus_RejectReportsReject(t *testing.T) {

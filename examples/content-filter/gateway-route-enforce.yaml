@@ -46,7 +46,7 @@ spec:
       group: gateway.envoyproxy.io
       path: "/mcp"
       contentFilter:
-        url: http://content-filter.content-filter.svc.cluster.local:80/filter
+        url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
         scopes:
           - Response
         # Fail-closed: evaluation runs must never see unscanned data.

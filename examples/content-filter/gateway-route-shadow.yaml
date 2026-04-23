@@ -49,10 +49,10 @@ spec:
       path: "/mcp"
       # ContentFilter: the PR-95-ported eval policy running in shadow
       # mode. For each `tools/call` RESPONSE the gateway POSTs the
-      # envelope to http://content-filter.content-filter:80/filter; the
-      # verdict is recorded but NEVER applied to the traffic.
+      # envelope to http://content-filter.content-filter:80/v1/filter;
+      # the verdict is recorded but NEVER applied to the traffic.
       contentFilter:
-        url: http://content-filter.content-filter.svc.cluster.local:80/filter
+        url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
         scopes:
           - Response
         # Failure mode is pass-through during shadow rollout: a

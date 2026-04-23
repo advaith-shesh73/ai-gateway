@@ -56,9 +56,18 @@ const filterStatusHeader = "X-Content-Filter-Status"
 type FilterStatus string
 
 const (
-	// FilterStatusPass means the filter ran and left the body
-	// unchanged.
+	// FilterStatusPass means the filter ran at least one policy and
+	// left the body unchanged (affirmative pass verdict).
 	FilterStatusPass FilterStatus = "pass"
+	// FilterStatusIdle means the filter was wired up but ran no
+	// policies for this call (e.g. Policies is empty, or every
+	// configured policy short-circuited before emitting a verdict).
+	// Semantically distinct from FilterStatusPass because "pass"
+	// asserts the body has been judged and cleared, whereas "idle"
+	// says nothing has judged it -- operators need to see that
+	// difference on dashboards when they forget to wire policies
+	// onto a route.
+	FilterStatusIdle FilterStatus = "idle"
 	// FilterStatusRedact means the filter rewrote the body.
 	FilterStatusRedact FilterStatus = "redact"
 	// FilterStatusReject means the filter blocked the call and the
@@ -135,10 +144,9 @@ const (
 // filter service itself (an external process implementing the wire
 // protocol described in [contentFilterRequest]/[contentFilterResponse])
 // decides whether to pass, redact, or reject. Operators deploy the
-// content-filter binary from
-// panacea-agent/services/aigw-content-filter-dispatcher alongside the
-// gateway; any implementation that speaks the same wire protocol is
-// acceptable.
+// content-filter service from
+// panacea-agent/services/aigw-content-filter alongside the gateway;
+// any implementation that speaks the same wire protocol is acceptable.
 type contentFilter struct {
 	url                     string
 	invokeOnRequest         bool
@@ -335,7 +343,16 @@ func compileContentFilter(cf *filterapi.MCPContentFilter, routeName filterapi.MC
 //   - Headers is always present and may be empty.
 //   - Scope/Method/Tool/Backend/Route are passed so the filter can dispatch
 //     policy without parsing the body.
+//   - Version pins the envelope shape. It is emitted unconditionally so
+//     that filter services can reject or translate requests they don't
+//     understand instead of best-effort guessing. Bump on any breaking
+//     wire change (renamed/removed field, changed semantics); additive
+//     changes keep the same version.
 type contentFilterRequest struct {
+	// Version is the wire-protocol version. Always set to
+	// [contentFilterRequestVersion]. Emitted at the top of the envelope
+	// so filter services can fast-reject unsupported versions.
+	Version   int    `json:"version"`
 	Route     string `json:"route"`
 	Backend   string `json:"backend"`
 	Scope     string `json:"scope"`
@@ -355,6 +372,12 @@ type contentFilterRequest struct {
 	ContentType string              `json:"contentType"`
 }
 
+// contentFilterRequestVersion is the current wire-protocol version of the
+// JSON envelope the gateway POSTs to the filter service. Bump on breaking
+// changes (renamed/removed fields, changed field semantics); additive
+// changes (new optional fields with omitempty) keep the same version.
+const contentFilterRequestVersion = 1
+
 // contentFilterResponse is the JSON envelope returned by the filter service.
 //
 //   - Action: "pass", "redact", or "reject". Unknown values are treated as
@@ -364,10 +387,20 @@ type contentFilterRequest struct {
 //     so the filter does not need to preserve it.
 //   - Reason: free-form string used in logs and propagated into the
 //     JSON-RPC error message when Action == "reject".
+//   - RanPolicies: list of policy names that actually executed against
+//     this call. An empty/missing list combined with Action=="pass"
+//     means the filter wired up but judged nothing -- the gateway
+//     surfaces this as [FilterStatusIdle] instead of [FilterStatusPass]
+//     so operators can catch mis-configured routes (e.g. Policies was
+//     empty or every policy short-circuited). Filters that cannot yet
+//     emit this list will leave it empty; the gateway falls back to
+//     treating "pass" as "idle" on an empty list, which is a safe
+//     visibility default.
 type contentFilterResponse struct {
-	Action     string `json:"action"`
-	BodyBase64 string `json:"bodyBase64,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	Action      string   `json:"action"`
+	BodyBase64  string   `json:"bodyBase64,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	RanPolicies []string `json:"ran_policies,omitempty"`
 }
 
 // errContentFilterRejected is returned by applyContentFilterOnRequest or
@@ -383,6 +416,12 @@ var errContentFilterFailed = errors.New("content filter invocation failed")
 //   - body: possibly rewritten JSON-RPC body, or the original body on pass.
 //   - rejected: true when the filter asked to reject the call.
 //   - reason:   free-form reason string (rejection or redaction), for logs.
+//   - ranPolicies: names of policies the filter actually executed for
+//     this call. Empty on reject/redact (callers don't consult it on
+//     those branches) and on older filters that don't yet emit the
+//     field. The WithStatus wrappers use this to distinguish a true
+//     "pass" (something judged, nothing to change) from an "idle"
+//     invocation (nothing judged).
 //   - err:      non-nil only when the filter could not be consulted
 //     successfully. Callers apply the FailurePolicy on err.
 func (cf *contentFilter) invoke(
@@ -392,7 +431,7 @@ func (cf *contentFilter) invoke(
 	route, backend, mcpMethod, tool string,
 	headers http.Header,
 	body []byte,
-) (newBody []byte, rejected bool, reason string, err error) {
+) (newBody []byte, rejected bool, reason string, ranPolicies []string, err error) {
 	// Always serialize policies as a JSON array, never as null: a
 	// stable wire shape keeps filter parsers simple and lets them
 	// reject unknown payloads without special-casing nullability.
@@ -401,6 +440,7 @@ func (cf *contentFilter) invoke(
 		policies = []string{}
 	}
 	env := contentFilterRequest{
+		Version:     contentFilterRequestVersion,
 		Route:       route,
 		Backend:     backend,
 		Scope:       string(scope),
@@ -413,7 +453,7 @@ func (cf *contentFilter) invoke(
 	}
 	envBytes, mErr := json.Marshal(env)
 	if mErr != nil {
-		return nil, false, "", fmt.Errorf("marshal content filter request: %w", mErr)
+		return nil, false, "", nil, fmt.Errorf("marshal content filter request: %w", mErr)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, cf.timeout)
@@ -421,50 +461,50 @@ func (cf *contentFilter) invoke(
 
 	req, reqErr := http.NewRequestWithContext(callCtx, http.MethodPost, cf.url, bytes.NewReader(envBytes))
 	if reqErr != nil {
-		return nil, false, "", fmt.Errorf("build content filter request: %w", reqErr)
+		return nil, false, "", nil, fmt.Errorf("build content filter request: %w", reqErr)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, doErr := client.Do(req)
 	if doErr != nil {
-		return nil, false, "", fmt.Errorf("invoke content filter: %w", doErr)
+		return nil, false, "", nil, fmt.Errorf("invoke content filter: %w", doErr)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, false, "", fmt.Errorf("content filter returned HTTP %d", resp.StatusCode)
+		return nil, false, "", nil, fmt.Errorf("content filter returned HTTP %d", resp.StatusCode)
 	}
 
 	respBytes, rErr := io.ReadAll(io.LimitReader(resp.Body, contentFilterMaxBodyBytes+1))
 	if rErr != nil {
-		return nil, false, "", fmt.Errorf("read content filter response: %w", rErr)
+		return nil, false, "", nil, fmt.Errorf("read content filter response: %w", rErr)
 	}
 	if len(respBytes) > contentFilterMaxBodyBytes {
-		return nil, false, "", fmt.Errorf("content filter response exceeds %d bytes", contentFilterMaxBodyBytes)
+		return nil, false, "", nil, fmt.Errorf("content filter response exceeds %d bytes", contentFilterMaxBodyBytes)
 	}
 
 	var decoded contentFilterResponse
 	if uErr := json.Unmarshal(respBytes, &decoded); uErr != nil {
-		return nil, false, "", fmt.Errorf("decode content filter response: %w", uErr)
+		return nil, false, "", nil, fmt.Errorf("decode content filter response: %w", uErr)
 	}
 
 	switch decoded.Action {
 	case contentFilterActionPass:
-		return body, false, "", nil
+		return body, false, "", decoded.RanPolicies, nil
 	case contentFilterActionReject:
-		return nil, true, decoded.Reason, nil
+		return nil, true, decoded.Reason, decoded.RanPolicies, nil
 	case contentFilterActionRedact:
 		if decoded.BodyBase64 == "" {
-			return nil, false, "", errors.New("content filter redact response missing bodyBase64")
+			return nil, false, "", nil, errors.New("content filter redact response missing bodyBase64")
 		}
 		replaced, decErr := base64.StdEncoding.DecodeString(decoded.BodyBase64)
 		if decErr != nil {
-			return nil, false, "", fmt.Errorf("decode content filter replacement body: %w", decErr)
+			return nil, false, "", nil, fmt.Errorf("decode content filter replacement body: %w", decErr)
 		}
-		return replaced, false, decoded.Reason, nil
+		return replaced, false, decoded.Reason, decoded.RanPolicies, nil
 	default:
-		return nil, false, "", fmt.Errorf("content filter returned unknown action %q", decoded.Action)
+		return nil, false, "", nil, fmt.Errorf("content filter returned unknown action %q", decoded.Action)
 	}
 }
 
@@ -569,7 +609,7 @@ func applyContentFilterOnRequestWithStatus(
 	}
 
 	started := time.Now()
-	newBody, rejected, reason, invokeErr := cf.invoke(ctx, client, contentFilterScopeRequest,
+	newBody, rejected, reason, ranPolicies, invokeErr := cf.invoke(ctx, client, contentFilterScopeRequest,
 		routeName, backendName, req.Method, tool, headers, body)
 	elapsed := time.Since(started)
 
@@ -602,6 +642,14 @@ func applyContentFilterOnRequestWithStatus(
 		return nil, FilterStatusReject, fmt.Errorf("%w: %s", errContentFilterRejected, reason)
 	}
 	if bytes.Equal(newBody, body) {
+		// Distinguish "filter ran at least one policy and it
+		// passed" (pass) from "filter was wired but judged
+		// nothing" (idle). An empty RanPolicies on a pass verdict
+		// is the signal for the latter -- see
+		// [contentFilterResponse.RanPolicies].
+		if len(ranPolicies) == 0 {
+			return req, FilterStatusIdle, nil
+		}
 		return req, FilterStatusPass, nil
 	}
 	msg, ok := tryDecodeJSONRPCMessage(newBody)
@@ -688,7 +736,7 @@ func applyContentFilterOnResponseWithStatus(
 	}
 
 	started := time.Now()
-	newBody, rejected, reason, invokeErr := cf.invoke(ctx, client, contentFilterScopeResponse,
+	newBody, rejected, reason, ranPolicies, invokeErr := cf.invoke(ctx, client, contentFilterScopeResponse,
 		routeName, backendName, method, tool, headers, body)
 	elapsed := time.Since(started)
 
@@ -722,6 +770,11 @@ func applyContentFilterOnResponseWithStatus(
 		return nil, FilterStatusReject, fmt.Errorf("%w: %s", errContentFilterRejected, reason)
 	}
 	if bytes.Equal(newBody, body) {
+		// See the Request path for why an empty RanPolicies on a
+		// pass verdict demotes the status to "idle".
+		if len(ranPolicies) == 0 {
+			return resp, FilterStatusIdle, nil
+		}
 		return resp, FilterStatusPass, nil
 	}
 	msg, ok := tryDecodeJSONRPCMessage(newBody)

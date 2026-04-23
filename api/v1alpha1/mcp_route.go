@@ -370,8 +370,15 @@ type MCPContentFilterConfig struct {
 	//     the blast radius of a filter compromise.
 	// When in doubt, omit the header.
 	//
+	// The 24-item cap is deliberately loose: operators commonly forward
+	// opaque correlation headers (tenant, ticket, request-id) alongside
+	// W3C trace-context propagation headers (traceparent, tracestate,
+	// baggage) that the gateway injects on behalf of the caller. A cap
+	// below ~20 forces operators to choose between their own forwards and
+	// the trace context, which regresses observability.
+	//
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:MaxItems=24
 	// +optional
 	ForwardHeaders []string `json:"forwardHeaders,omitempty"`
 
@@ -464,9 +471,21 @@ type MCPContentFilterConfig struct {
 	// enum; the gateway does not need to be rebuilt to forward a new
 	// name once the enum accepts it.
 	//
+	// Order is significant. The filter service merges verdicts
+	// left-to-right (reject > redact > pass), so a redact emitted by an
+	// earlier policy becomes the input body seen by later policies in
+	// the list. `[pii, evalpolicy]` therefore has evalpolicy judge the
+	// already-PII-redacted body, while `[evalpolicy, pii]` has
+	// evalpolicy judge the raw body. The list type is `atomic` (not
+	// `set`) so Kubernetes Server-Side Apply preserves the author's
+	// ordering. Uniqueness within the list is enforced by a CEL
+	// validation on the struct. See
+	// panacea-agent/services/aigw-content-filter/app/filter_core.py for
+	// the merge semantics in the reference dispatcher.
+	//
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:MaxItems=16
-	// +listType=set
+	// +listType=atomic
 	// +optional
 	Policies []MCPContentFilterPolicy `json:"policies,omitempty"`
 }
