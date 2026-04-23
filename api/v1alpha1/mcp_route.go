@@ -401,9 +401,9 @@ type MCPContentFilterConfig struct {
 	// URL, scopes, timeout, or headers.
 	//
 	// Defaults to true. Use the process-wide kill switch
-	// (MCPContentFilterPolicy.GlobalDisable, distributed via the
-	// policy ConfigMap) to disable every filter in one step during
-	// an incident.
+	// (MCPContentFilterPolicyConfig.GlobalDisable, distributed via
+	// the policy ConfigMap) to disable every filter in one step
+	// during an incident.
 	//
 	// +kubebuilder:validation:Optional
 	// +optional
@@ -435,7 +435,75 @@ type MCPContentFilterConfig struct {
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
 	ShadowSampleRatePermille *int32 `json:"shadowSampleRatePermille,omitempty"`
+
+	// Policies names the policy kinds the content-filter service should
+	// apply when invoked for this route/backend. The gateway forwards
+	// this list verbatim in the filter envelope; it does not interpret
+	// the values itself. The filter service acts as a stateless
+	// dispatcher, mapping each policy name to its backing engine (for
+	// example "pii" -> PII anonymizer, "evalpolicy" -> LLM-backed
+	// evaluation-mode anti-leakage), invoking them, and merging the
+	// verdicts (reject > redact > pass).
+	//
+	// This is the single source of truth for "is PII on for this
+	// route/backend?". Moving the decision here keeps the filter
+	// backend-agnostic and matches the extAuth/AuthorizationPolicy
+	// pattern other gateways use: the policy plane owns the what, the
+	// filter plane owns the how.
+	//
+	// An empty or missing list disables all policy execution. The
+	// gateway will still invoke the filter at the configured Scopes
+	// (useful under Mode=Shadow to measure envelope cost / connectivity
+	// without running any engine), but the filter is expected to no-op
+	// and return action=pass. Attaching a filter URL without any
+	// Policies is explicit opt-in to "the filter is wired but idle";
+	// it is NOT the same as leaving the whole ContentFilter unset,
+	// which emits X-Content-Filter-Status: off.
+	//
+	// New policy kinds are added by extending MCPContentFilterPolicy's
+	// enum; the gateway does not need to be rebuilt to forward a new
+	// name once the enum accepts it.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=set
+	// +optional
+	Policies []MCPContentFilterPolicy `json:"policies,omitempty"`
 }
+
+// MCPContentFilterPolicy names a policy kind that the content-filter
+// service should apply. The gateway forwards this list verbatim in the
+// filter envelope; the filter service decides how each name maps to
+// its backing engine (PII anonymizer, LLM-backed evalpolicy, future
+// policies such as secret scrubbing or prompt-injection detection).
+//
+// The enum is intentionally small and open-ended. New policies are
+// added by extending this type so the CRD schema enforces spelling:
+// unknown values are rejected by the Kubernetes API server rather than
+// silently forwarded as no-ops. Operators can therefore ship a policy
+// name they know the current filter service understands without the
+// gateway having to learn its semantics.
+//
+// +kubebuilder:validation:Enum=pii;evalpolicy
+type MCPContentFilterPolicy string
+
+const (
+	// MCPContentFilterPolicyPII selects PII / sensitive-data anonymization.
+	// The filter service is expected to call its PII engine (for example
+	// the pii-service-gpu backing the aigw-content-filter dispatcher) and
+	// rewrite the body with placeholders such as [ANONYMIZED_EMAIL] in
+	// place of detected PII. Suitable for every backend that returns
+	// customer-derived text.
+	MCPContentFilterPolicyPII MCPContentFilterPolicy = "pii"
+
+	// MCPContentFilterPolicyEvalPolicy selects the LLM-backed
+	// evaluation-mode anti-leakage policy (ticket-ID / transcript
+	// redaction). Typically paired with an operator-allowlisted
+	// ForwardHeader such as X-Eval-Ticket-Id so the filter can exclude
+	// the active evaluation ticket's own content from returned results.
+	// Use on backends that surface raw ticket corpora to an evaluator.
+	MCPContentFilterPolicyEvalPolicy MCPContentFilterPolicy = "evalpolicy"
+)
 
 // MCPContentFilterScope selects a phase of the tools/call lifecycle.
 //

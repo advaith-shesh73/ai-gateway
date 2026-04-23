@@ -146,6 +146,14 @@ type contentFilter struct {
 	timeout                 time.Duration
 	failClosed              bool
 	forwardHeadersCanonical []string
+	// policies is the compiled list of policy names forwarded
+	// verbatim in the filter envelope. The gateway does not
+	// interpret these; the filter service is expected to dispatch
+	// based on the list (pii -> PII anonymizer, evalpolicy -> LLM
+	// evalpolicy, ...). A nil or empty slice is serialized as an
+	// empty JSON array so the wire shape is stable regardless of
+	// policy attachment.
+	policies []string
 	// mode is the compiled enforcement mode. Empty is treated as
 	// MCPContentFilterModeEnforce at invocation time so legacy
 	// configs keep their behavior.
@@ -165,7 +173,7 @@ type contentFilter struct {
 	// every invocation so a single ConfigMap edit can stop every
 	// filter in the cluster. The pointer is never mutated after
 	// publication; hot-reloading rebuilds the whole contentFilter.
-	policy *filterapi.MCPContentFilterPolicy
+	policy *filterapi.MCPContentFilterPolicyConfig
 }
 
 // effectiveMode returns the filter's compiled mode, substituting
@@ -292,6 +300,30 @@ func compileContentFilter(cf *filterapi.MCPContentFilter, routeName filterapi.MC
 			out.forwardHeadersCanonical = append(out.forwardHeadersCanonical, canon)
 		}
 	}
+
+	// Policies are pre-flattened to plain strings and deduplicated
+	// while preserving author order, so the envelope serialization
+	// path stays allocation-free on the hot request path. An unknown
+	// policy value is NOT rejected here: the gateway is intentionally
+	// opaque to policy semantics, and shipping a forward-compatible
+	// name lets the filter service roll out new policies without a
+	// gateway rebuild. Schema validation on the CRD enum catches
+	// typos at admission time.
+	if len(cf.Policies) > 0 {
+		seen := make(map[string]struct{}, len(cf.Policies))
+		out.policies = make([]string, 0, len(cf.Policies))
+		for _, p := range cf.Policies {
+			s := strings.TrimSpace(string(p))
+			if s == "" {
+				continue
+			}
+			if _, dup := seen[s]; dup {
+				continue
+			}
+			seen[s] = struct{}{}
+			out.policies = append(out.policies, s)
+		}
+	}
 	return out, nil
 }
 
@@ -304,11 +336,20 @@ func compileContentFilter(cf *filterapi.MCPContentFilter, routeName filterapi.MC
 //   - Scope/Method/Tool/Backend/Route are passed so the filter can dispatch
 //     policy without parsing the body.
 type contentFilterRequest struct {
-	Route       string              `json:"route"`
-	Backend     string              `json:"backend"`
-	Scope       string              `json:"scope"`
-	MCPMethod   string              `json:"mcpMethod"`
-	Tool        string              `json:"tool,omitempty"`
+	Route     string `json:"route"`
+	Backend   string `json:"backend"`
+	Scope     string `json:"scope"`
+	MCPMethod string `json:"mcpMethod"`
+	Tool      string `json:"tool,omitempty"`
+	// Policies is the list of policy names the filter service should
+	// apply for this call. The gateway forwards this list verbatim
+	// from [contentFilter.policies] and never interprets it. An empty
+	// or nil slice is serialized as an empty JSON array, which the
+	// filter is expected to treat as "run no engines / pass through".
+	// This is the single source of truth for policy enablement: the
+	// filter must NOT consult backend-name or route-name to decide
+	// which engines to run.
+	Policies    []string            `json:"policies"`
 	Headers     map[string][]string `json:"headers"`
 	BodyBase64  string              `json:"bodyBase64"`
 	ContentType string              `json:"contentType"`
@@ -352,12 +393,20 @@ func (cf *contentFilter) invoke(
 	headers http.Header,
 	body []byte,
 ) (newBody []byte, rejected bool, reason string, err error) {
+	// Always serialize policies as a JSON array, never as null: a
+	// stable wire shape keeps filter parsers simple and lets them
+	// reject unknown payloads without special-casing nullability.
+	policies := cf.policies
+	if policies == nil {
+		policies = []string{}
+	}
 	env := contentFilterRequest{
 		Route:       route,
 		Backend:     backend,
 		Scope:       string(scope),
 		MCPMethod:   mcpMethod,
 		Tool:        tool,
+		Policies:    policies,
 		Headers:     cf.selectHeaders(headers),
 		BodyBase64:  base64.StdEncoding.EncodeToString(body),
 		ContentType: "application/json",

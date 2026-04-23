@@ -127,6 +127,71 @@ func TestCompileContentFilter_CustomTimeoutAndFailPolicy(t *testing.T) {
 	require.True(t, cf.failClosed)
 }
 
+// --- Policies compile ------------------------------------------------------
+
+// TestCompileContentFilter_PoliciesEmptyYieldsNil asserts that neither
+// a missing nor an empty Policies slice allocates anything — the
+// envelope path substitutes []string{} at send time, but the compiled
+// filter stores nil. This keeps the "no policies attached" snapshot
+// cheap and lets the envelope code stay the single place that decides
+// the wire shape.
+func TestCompileContentFilter_PoliciesEmptyYieldsNil(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+			URL:    "http://x",
+			Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		}, "r", "b")
+		require.NoError(t, err)
+		require.Nil(t, cf.policies)
+	})
+	t.Run("empty_slice", func(t *testing.T) {
+		cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+			URL:      "http://x",
+			Scopes:   []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+			Policies: []filterapi.MCPContentFilterPolicy{},
+		}, "r", "b")
+		require.NoError(t, err)
+		require.Nil(t, cf.policies)
+	})
+}
+
+// TestCompileContentFilter_PoliciesPreservedAndDeduped asserts the
+// compile step preserves author-declared order while dropping duplicate
+// and whitespace-only entries. Order matters because the filter service
+// merges verdicts with a well-defined precedence; reordering would
+// change observability output (trace attribute order, audit log).
+func TestCompileContentFilter_PoliciesPreservedAndDeduped(t *testing.T) {
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:    "http://x",
+		Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{
+			filterapi.MCPContentFilterPolicyPII,
+			filterapi.MCPContentFilterPolicyEvalPolicy,
+			filterapi.MCPContentFilterPolicyPII, // duplicate
+			"",                                  // empty, skipped
+			"   ",                               // whitespace-only, skipped
+			"secrets",                           // forward-compat unknown value accepted verbatim
+		},
+	}, "r", "b")
+	require.NoError(t, err)
+	require.Equal(t, []string{"pii", "evalpolicy", "secrets"}, cf.policies)
+}
+
+// TestCompileContentFilter_PoliciesAcceptsUnknown asserts the gateway
+// does NOT reject unknown policy names at compile time. The CRD's
+// Enum validator catches typos at admission, and forward-compat is
+// expensive to lose: an operator should be able to enable a new policy
+// by editing CRD + filter service without rebuilding the gateway.
+func TestCompileContentFilter_PoliciesAcceptsUnknown(t *testing.T) {
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:      "http://x",
+		Scopes:   []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{"future-policy"},
+	}, "r", "b")
+	require.NoError(t, err)
+	require.Equal(t, []string{"future-policy"}, cf.policies)
+}
+
 // --- selectHeaders ---------------------------------------------------------
 
 func TestSelectHeaders_NilSourceReturnsEmpty(t *testing.T) {
@@ -193,6 +258,51 @@ func TestInvoke_PassReturnsOriginalBody(t *testing.T) {
 	require.False(t, rejected)
 	require.Empty(t, reason)
 	require.Equal(t, body, newBody)
+}
+
+// TestInvoke_PoliciesForwardedInEnvelope asserts the compiled policy
+// list is serialized on the filter-request wire in the order the
+// operator declared and is always an array (never null / missing) so
+// filter implementations can rely on a stable schema.
+func TestInvoke_PoliciesForwardedInEnvelope(t *testing.T) {
+	var got contentFilterRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:    srv.URL,
+		Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{
+			filterapi.MCPContentFilterPolicyPII,
+			filterapi.MCPContentFilterPolicyEvalPolicy,
+		},
+	}, "r", "b")
+	require.NoError(t, err)
+	_, _, _, err = cf.invoke(context.Background(), &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"pii", "evalpolicy"}, got.Policies)
+}
+
+// TestInvoke_PoliciesEmptyEnvelopeIsArray asserts an unset Policies
+// field still produces an empty JSON array on the wire. Filters that
+// iterate policies to decide which engines to run must never observe
+// JSON null — that would force every filter to special-case nullability.
+func TestInvoke_PoliciesEmptyEnvelopeIsArray(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
+	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"policies":[]`,
+		"empty Policies must serialize as [] to keep a stable wire shape")
 }
 
 func TestInvoke_RedactReturnsNewBody(t *testing.T) {

@@ -5,20 +5,28 @@
 
 package filterapi
 
-// MCPContentFilterPolicy holds the cluster-scoped tunables that the
-// gateway reads at runtime from the content-filter-policy ConfigMap.
+// MCPContentFilterPolicyConfig holds the cluster-scoped tunables that
+// the gateway reads at runtime from the content-filter-policy
+// ConfigMap.
 //
 // After the gateway slimming refactor the gateway speaks to an external
 // content-filter service over HTTP and no longer hosts any of the
 // in-process knobs (PII, cache, breaker, Jira, backends, eval header,
 // wire limits). All of those policy fields now live with the dispatcher
-// service in panacea-agent/services/aigw-content-filter-dispatcher and
-// are loaded from that service's own configuration source.
+// service in panacea-agent/services/aigw-content-filter and are loaded
+// from that service's own configuration source.
 //
 // What stays here is the single observable lever that the gateway has
 // to honor: a process-wide kill switch every operator team can flip on
 // during an incident without touching any MCPGatewayRoute.
-type MCPContentFilterPolicy struct {
+//
+// Historical note: the type was previously named MCPContentFilterPolicy.
+// It was renamed to MCPContentFilterPolicyConfig once the CRD gained a
+// string enum called MCPContentFilterPolicy (the policy-kind selector
+// used by [MCPContentFilter.Policies]) so the two concepts — "which
+// engines should run" (enum) vs. "is filtering globally on" (config
+// struct) — have distinct, unambiguous names.
+type MCPContentFilterPolicyConfig struct {
 	// GlobalDisable is the process-wide kill switch. When true, every
 	// MCPContentFilter attached to any backend is short-circuited:
 	// the gateway emits X-Content-Filter-Status: disabled, records
