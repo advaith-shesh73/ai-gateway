@@ -8,7 +8,10 @@ package tracing
 import (
 	"context"
 	"net/http"
+	"os"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -177,6 +180,142 @@ func TestTracer_StartSpanAndInjectMeta_Baggage(t *testing.T) {
 	require.Contains(t, outHeader, "ticket=TICK-42")
 	require.Contains(t, outHeader, "role=oncall")
 	require.Contains(t, outHeader, "opaque=keep-me")
+}
+
+// TestTracer_BaggageTruncatedOnSpan verifies that an abusively large
+// baggage value is truncated before being copied onto a span attribute,
+// bounding OTLP payload size. The full value still propagates on the
+// baggage header unchanged because propagation is independent of attribute
+// promotion.
+func TestTracer_BaggageTruncatedOnSpan(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	// 512-byte ticket value, 4x the attribute cap. Using an ASCII run so
+	// the test asserts on exact byte lengths independent of UTF-8 width.
+	big := strings.Repeat("A", 512)
+	headers := http.Header{}
+	headers.Set("baggage", "ticket="+big)
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+
+	var got string
+	var found bool
+	for _, a := range spans[0].Attributes {
+		if a.Key == "mcp.client.ticket" {
+			got = a.Value.AsString()
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "expected mcp.client.ticket attribute")
+	require.LessOrEqual(t, len(got), maxBaggageAttrValueBytes+len("..."),
+		"span attribute value must be capped to bound OTLP payload size")
+	require.True(t, strings.HasSuffix(got, "..."),
+		"truncated values must carry an ellipsis marker so operators see they were clipped")
+
+	// Propagation is unchanged: the full baggage value still leaves on
+	// the outbound baggage header so downstream services see the raw
+	// client input.
+	require.Contains(t, headers.Get("baggage"), big,
+		"outbound baggage header must carry the full client value verbatim")
+}
+
+// TestTracer_BaggageEmptyValueSkipped verifies that an empty-valued
+// baggage key does NOT create an empty span attribute. Empty attributes
+// are impossible to filter on in backends and just pollute the span.
+func TestTracer_BaggageEmptyValueSkipped(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	// Client-sent baggage with an empty ticket -- legal per the W3C
+	// grammar but useless as a span attribute.
+	headers.Set("baggage", "ticket=,role=oncall")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	for _, a := range spans[0].Attributes {
+		require.NotEqual(t, attribute.Key("mcp.client.ticket"), a.Key,
+			"empty-valued baggage keys must not be promoted to span attributes")
+	}
+	require.Contains(t, spans[0].Attributes,
+		attribute.String("mcp.client.role", "oncall"),
+		"non-empty baggage values in the same header must still be promoted")
+}
+
+// TestBaggageAttrsFromEnv_OptIn verifies the operator-level opt-in
+// behavior of MCP_TRACE_BAGGAGE_ATTRS.
+func TestBaggageAttrsFromEnv_OptIn(t *testing.T) {
+	t.Run("unset returns defaults", func(t *testing.T) {
+		t.Setenv(mcpTraceBaggageAttrsEnv, "")
+		_ = os.Unsetenv(mcpTraceBaggageAttrsEnv)
+		m := baggageAttrsFromEnv()
+		require.Equal(t, "mcp.client.ticket", m["ticket"])
+		require.Equal(t, "mcp.client.user", m["user"])
+		require.Equal(t, "mcp.client.role", m["role"])
+	})
+
+	t.Run("custom keys override defaults", func(t *testing.T) {
+		t.Setenv(mcpTraceBaggageAttrsEnv, "ticket, tenant ,ignored-empty= ")
+		m := baggageAttrsFromEnv()
+		require.Equal(t, "mcp.client.ticket", m["ticket"])
+		require.Equal(t, "mcp.client.tenant", m["tenant"])
+		// Default keys that were not listed in the override MUST NOT
+		// leak through -- the env var is a replace, not a merge, so
+		// operators can narrow the surface.
+		_, hasUser := m["user"]
+		require.False(t, hasUser, "env override must narrow the allow-list, not merge with defaults")
+		_, hasRole := m["role"]
+		require.False(t, hasRole)
+	})
+
+	t.Run("empty string promotes nothing", func(t *testing.T) {
+		t.Setenv(mcpTraceBaggageAttrsEnv, "")
+		m := baggageAttrsFromEnv()
+		require.Empty(t, m, "explicit empty MCP_TRACE_BAGGAGE_ATTRS must disable baggage promotion entirely")
+	})
+}
+
+// TestTruncateBaggageAttrValue verifies UTF-8-aware truncation so a cap
+// that lands inside a multi-byte rune does not produce invalid UTF-8.
+func TestTruncateBaggageAttrValue(t *testing.T) {
+	t.Run("short value unchanged", func(t *testing.T) {
+		require.Equal(t, "hello", truncateBaggageAttrValue("hello"))
+	})
+	t.Run("oversize ascii truncated with marker", func(t *testing.T) {
+		in := strings.Repeat("x", maxBaggageAttrValueBytes+10)
+		out := truncateBaggageAttrValue(in)
+		require.Equal(t, strings.Repeat("x", maxBaggageAttrValueBytes)+"...", out)
+	})
+	t.Run("multi-byte runes are not split", func(t *testing.T) {
+		// Each "猫" is 3 bytes in UTF-8. 45 runes = 135 bytes, over the
+		// 128-byte cap and guaranteed to land mid-rune at byte 128.
+		in := strings.Repeat("猫", 45)
+		out := truncateBaggageAttrValue(in)
+		require.True(t, utf8.ValidString(out),
+			"truncation must not split a rune: got %q", out)
+		require.True(t, strings.HasSuffix(out, "..."))
+	})
 }
 
 func Test_getMCPAttributes(t *testing.T) {

@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -22,16 +24,79 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 )
 
-// baggageSpanAttributes maps well-known W3C baggage keys (set by clients on
-// inbound HTTP requests per the client contract) to OTel span attribute keys.
-// Keeping this as a static map keeps the PII surface small: only these three
-// correlation identifiers are copied onto spans. Any other baggage keys the
-// client sets still propagate to downstream services via the baggage header
-// but are not promoted to span attributes.
-var baggageSpanAttributes = map[string]string{
+// defaultBaggageSpanAttributes maps well-known W3C baggage keys (set by
+// clients on inbound HTTP requests per the client contract) to OTel span
+// attribute keys. Keeping this as a static default map keeps the PII
+// surface small: only these three correlation identifiers are copied onto
+// spans by default. Any other baggage keys the client sets still propagate
+// to downstream services via the baggage header but are not promoted to
+// span attributes unless the operator opts in via [mcpTraceBaggageAttrsEnv].
+var defaultBaggageSpanAttributes = map[string]string{
 	"ticket": "mcp.client.ticket",
 	"user":   "mcp.client.user",
 	"role":   "mcp.client.role",
+}
+
+// mcpTraceBaggageAttrsEnv is an optional env var the operator can set to
+// override the promoted baggage key set. Value is a comma-separated list
+// of baggage keys, e.g. `MCP_TRACE_BAGGAGE_ATTRS=ticket,user,role`. When
+// unset, [defaultBaggageSpanAttributes] is used. When set to an empty
+// string, NO baggage keys are promoted to span attributes (baggage still
+// propagates on the wire for downstream services).
+const mcpTraceBaggageAttrsEnv = "MCP_TRACE_BAGGAGE_ATTRS"
+
+// maxBaggageAttrValueBytes caps how many bytes of a baggage value we copy
+// onto a span attribute. Baggage is free-form client-supplied data: even
+// though the client contract only promises opaque short identifiers, a
+// misbehaving or malicious client could stuff an arbitrarily large value
+// into a known key. Truncating here bounds the per-span attribute size so
+// a bad client cannot inflate OTLP export payloads or trip
+// backend-specific attribute-length limits. The value is in bytes, not
+// runes, to keep the bound independent of UTF-8 width.
+const maxBaggageAttrValueBytes = 128
+
+// baggageAttrsFromEnv returns the effective baggage-to-attribute map for
+// the process. Precedence: [mcpTraceBaggageAttrsEnv] override, then the
+// static [defaultBaggageSpanAttributes] default. Unknown or empty keys in
+// the env var are skipped; duplicate keys are deduplicated. The returned
+// map is fresh on every call so callers can safely mutate it.
+func baggageAttrsFromEnv() map[string]string {
+	raw, ok := os.LookupEnv(mcpTraceBaggageAttrsEnv)
+	if !ok {
+		out := make(map[string]string, len(defaultBaggageSpanAttributes))
+		for k, v := range defaultBaggageSpanAttributes {
+			out[k] = v
+		}
+		return out
+	}
+	// Empty-string override means "promote nothing"; returning an empty
+	// map is intentional and distinct from the unset case above.
+	out := map[string]string{}
+	for _, key := range strings.Split(raw, ",") {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		out[key] = "mcp.client." + key
+	}
+	return out
+}
+
+// truncateBaggageAttrValue enforces the [maxBaggageAttrValueBytes] cap.
+// Values at or below the cap are returned unchanged. Values above the cap
+// are truncated to the cap and an ellipsis marker is appended so the
+// downstream consumer can see the value was clipped. Truncation is
+// byte-based; if the cap falls inside a multi-byte rune we back up to the
+// previous rune boundary so the result stays valid UTF-8.
+func truncateBaggageAttrValue(v string) string {
+	if len(v) <= maxBaggageAttrValueBytes {
+		return v
+	}
+	cut := maxBaggageAttrValueBytes
+	for cut > 0 && v[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return v[:cut] + "..."
 }
 
 // Ensure mcpSpan implements [tracingapi.MCPSpan].
@@ -75,6 +140,12 @@ type mcpTracer struct {
 	tracer            trace.Tracer
 	propagator        propagation.TextMapPropagator
 	attributeMappings map[string]string
+	// baggageAttrs is the effective baggage-key -> span-attribute map for
+	// this tracer. Resolved once at construction from
+	// [mcpTraceBaggageAttrsEnv] so per-request work stays cheap and so
+	// env changes take effect at process restart (same lifecycle as the
+	// rest of the OTel config that [NewTracingFromEnv] reads).
+	baggageAttrs map[string]string
 }
 
 func newMCPTracer(tracer trace.Tracer, propagator propagation.TextMapPropagator, attributeMappings map[string]string) tracingapi.MCPTracer {
@@ -82,10 +153,33 @@ func newMCPTracer(tracer trace.Tracer, propagator propagation.TextMapPropagator,
 		tracer:            tracer,
 		propagator:        propagator,
 		attributeMappings: attributeMappings,
+		baggageAttrs:      baggageAttrsFromEnv(),
 	}
 }
 
-// StartSpanAndInjectMeta implements [tracingapi.MCPTracer.StartSpanAndInjectMeta].
+// StartSpanAndInjectMeta starts a new MCP span for req and injects the
+// resulting trace context back into both the MCP `_meta` map on param and
+// the passed-in HTTP `headers`.
+//
+// Side effects (MUTATION):
+//   - `param` is mutated: the MCP `_meta` map is created if nil and is
+//     updated to carry the new span's trace context for downstream MCP
+//     hops.
+//   - `headers` is mutated: the OTel propagator writes `traceparent` /
+//     `tracestate` / `baggage` so any upstream HTTP hop driven off the
+//     same header set sees the gateway-created span as its parent. This
+//     overwrites any existing values for those keys. Callers that need
+//     the unmodified inbound headers must clone them first.
+//
+// PII contract: well-known baggage keys (see [defaultBaggageSpanAttributes]
+// or [mcpTraceBaggageAttrsEnv]) are promoted onto the span under
+// `mcp.client.*` attributes. Operators opt in which keys get promoted;
+// values are capped at [maxBaggageAttrValueBytes] to bound attribute
+// size against misbehaving clients. The full baggage header still
+// propagates to downstream services unchanged so opaque keys reach
+// pii-service + evalpolicy for correlation without being exposed on
+// spans. Callers must not put secrets or request bodies into baggage --
+// the W3C contract treats baggage as user-visible metadata.
 func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Request, param mcp.Params, headers http.Header) tracingapi.MCPSpan {
 	attrs := []attribute.KeyValue{
 		attribute.String("mcp.protocol.version", "2025-06-18"),
@@ -130,14 +224,26 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 
 	// Copy well-known baggage keys onto span attributes. The baggage
 	// itself still propagates via [propagator.Inject] below -- this just
-	// surfaces correlation identifiers (ticket/user/role) on the span so
-	// operators can find all traces for a ticket or user without joining
-	// against the baggage header.
+	// surfaces correlation identifiers (ticket/user/role by default, or
+	// whatever keys the operator opted into via [mcpTraceBaggageAttrsEnv])
+	// on the span so operators can find all traces for a ticket or user
+	// without joining against the baggage header.
+	//
+	// Empty values are skipped so a client that sets `ticket=` (no value)
+	// does not create a span attribute that is impossible to query on.
+	// Oversized values are truncated to [maxBaggageAttrValueBytes] so a
+	// misbehaving client cannot inflate span export payloads.
 	if bag := baggage.FromContext(parentCtx); bag.Len() > 0 {
-		for key, attrKey := range baggageSpanAttributes {
-			if m := bag.Member(key); m.Key() != "" {
-				attrs = append(attrs, attribute.String(attrKey, m.Value()))
+		for key, attrKey := range m.baggageAttrs {
+			member := bag.Member(key)
+			if member.Key() == "" {
+				continue
 			}
+			value := member.Value()
+			if value == "" {
+				continue
+			}
+			attrs = append(attrs, attribute.String(attrKey, truncateBaggageAttrValue(value)))
 		}
 	}
 
