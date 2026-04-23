@@ -57,9 +57,20 @@ spec:
         # Per-backend kill switch. Set to false to revert to
         # unfiltered traffic for this backend without editing the
         # rest of the spec. For cluster-wide immediate rollback,
-        # flip `globalDisable: true` on the MCPContentFilterPolicy
+        # flip `globalDisable: true` on the MCPContentFilterPolicyConfig
         # ConfigMap (see global-kill-switch.yaml).
         enabled: true
+        # Policies the filter service must apply for this backend.
+        # The gateway forwards the list verbatim in the envelope and
+        # does not interpret values — the filter service is the
+        # dispatcher. Evaluation traffic needs both PII anonymization
+        # AND the LLM-backed evalpolicy (ticket-ID anti-leakage), so
+        # the list is `[pii, evalpolicy]`. Dropping one entry disables
+        # exactly that engine for this backend without touching the
+        # filter service.
+        policies:
+          - pii
+          - evalpolicy
         forwardHeaders:
           - "Authorization"
           - "X-Eval-Ticket-Id"

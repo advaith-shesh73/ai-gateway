@@ -3,7 +3,7 @@
 # The full text of the Apache license is available in the LICENSE file at
 # the root of the repo.
 #
-# Cluster-wide kill switch: MCPContentFilterPolicy ConfigMap.
+# Cluster-wide kill switch: MCPContentFilterPolicyConfig ConfigMap.
 #
 # The gateway reads this ConfigMap at startup (and hot-reloads it via
 # the Envoy AI Gateway controller). Flipping `globalDisable: true`
@@ -27,15 +27,15 @@
 #
 # ConfigMap shape:
 #   key  = "policy.json"
-#   value = JSON-encoded filterapi.MCPContentFilterPolicy (struct in
-#           internal/filterapi/mcp_content_filter_policy.go)
+#   value = JSON-encoded filterapi.MCPContentFilterPolicyConfig
+#           (struct in internal/filterapi/mcp_content_filter_policy.go)
 #
-# Only `globalDisable` is operationally meaningful for THIS example;
-# the rest of the policy governs the in-process content filter (PII,
-# Jira, etc.) and is left at safe defaults. A production deployment
-# running both the in-process filter AND the out-of-process
-# content-filter service would populate PII/Jira/Cache/Breaker
-# sections here too.
+# After the gateway slimming refactor the struct carries ONLY
+# `globalDisable`. PII / cache / breaker / backend-enable / evalHeader
+# / wire-limit knobs moved to the external content-filter service's
+# own configuration, which is per-service and independently reloaded.
+# Per-route policy selection lives on MCPContentFilter.policies in each
+# MCPRoute spec, not here.
 
 ---
 apiVersion: v1
@@ -52,40 +52,5 @@ metadata:
 data:
   policy.json: |
     {
-      "globalDisable": false,
-      "requirePIIFailClosed": false,
-      "pii": {
-        "url": "http://pii-service.pii.svc.cluster.local:8081/anonymize",
-        "timeoutSeconds": 60,
-        "failClosed": false,
-        "maxCharsPerRequest": 40000,
-        "maxParallelChunks": 4,
-        "maxParallelParts": 4,
-        "httpMaxConnections": 100,
-        "httpMaxIdle": 20
-      },
-      "cache": {
-        "enabled": true,
-        "maxEntries": 2048,
-        "ttlSeconds": 900
-      },
-      "breaker": {
-        "enabled": true,
-        "failureThreshold": 10,
-        "resetSeconds": 120
-      },
-      "backends": {
-        "enableSupportGPT": true,
-        "enableNuRAG": true,
-        "enableGlean": true,
-        "enableJira": false,
-        "enableDefaultPII": true
-      },
-      "evalHeader": {
-        "name": "x-eval-exclude-ticket-id",
-        "strict": false
-      },
-      "wire": {
-        "maxBodyBytes": 2097152
-      }
+      "globalDisable": false
     }
