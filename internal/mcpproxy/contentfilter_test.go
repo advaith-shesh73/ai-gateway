@@ -18,6 +18,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -242,6 +244,45 @@ func newTestFilter(t *testing.T, serverURL string, failClosed bool) *contentFilt
 	}, "r", "b")
 	require.NoError(t, err)
 	return cf
+}
+
+// TestInvoke_PropagatesW3CTraceAndBaggageHeaders asserts the gateway
+// injects the ambient W3C trace context and baggage into the outbound
+// filter HTTP request. This is what lets filter-side spans chain under
+// the gateway span and what carries ticket/user/role correlation keys
+// down to pii-service and the evalpolicy brain.
+func TestInvoke_PropagatesW3CTraceAndBaggageHeaders(t *testing.T) {
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{},
+	))
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+
+	// Seed a caller context with an inbound traceparent + baggage as the
+	// configured propagator would after StartSpanAndInjectMeta ran on an
+	// inbound gateway request.
+	inbound := http.Header{}
+	inbound.Set("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+	inbound.Set("baggage", "ticket=TICK-42,role=oncall")
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(inbound))
+
+	cf := newTestFilter(t, srv.URL, false)
+	_, _, _, err := cf.invoke(ctx, &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+
+	require.NotEmpty(t, got.Get("traceparent"),
+		"outbound filter request must carry W3C traceparent")
+	require.Contains(t, got.Get("baggage"), "ticket=TICK-42",
+		"outbound filter request must carry baggage for downstream correlation")
+	require.Contains(t, got.Get("baggage"), "role=oncall")
 }
 
 func TestInvoke_PassReturnsOriginalBody(t *testing.T) {

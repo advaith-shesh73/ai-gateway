@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -465,6 +467,14 @@ func (cf *contentFilter) invoke(
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+
+	// Propagate W3C trace context and baggage to the filter service so
+	// filter-side spans chain under the gateway span and correlation
+	// identifiers (ticket/user/role) reach pii-service and the evalpolicy
+	// brain. The propagator is the process-wide one configured by
+	// [tracing.NewTracingFromEnv]; when tracing is disabled this is a
+	// no-op propagator and no headers are written.
+	otel.GetTextMapPropagator().Inject(callCtx, propagation.HeaderCarrier(req.Header))
 
 	resp, doErr := client.Do(req)
 	if doErr != nil {

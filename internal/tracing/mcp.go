@@ -13,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
@@ -20,6 +21,18 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/lang"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 )
+
+// baggageSpanAttributes maps well-known W3C baggage keys (set by clients on
+// inbound HTTP requests per the client contract) to OTel span attribute keys.
+// Keeping this as a static map keeps the PII surface small: only these three
+// correlation identifiers are copied onto spans. Any other baggage keys the
+// client sets still propagate to downstream services via the baggage header
+// but are not promoted to span attributes.
+var baggageSpanAttributes = map[string]string{
+	"ticket": "mcp.client.ticket",
+	"user":   "mcp.client.user",
+	"role":   "mcp.client.role",
+}
 
 // Ensure mcpSpan implements [tracingapi.MCPSpan].
 var _ tracingapi.MCPSpan = (*mcpSpan)(nil)
@@ -93,7 +106,17 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 		}
 	}
 
-	// Extract trace context from incoming meta.
+	// Extract trace context and baggage. HTTP headers are the primary
+	// source because the client contract (W3C Trace Context + baggage) is
+	// carried over HTTP. MCP `_meta` is a secondary source for
+	// protocol-level propagation (e.g. nested MCP calls) and is applied
+	// after headers so that meta-carried trace context can override when
+	// present -- this preserves the pre-existing behavior for callers that
+	// only set trace context via `_meta`.
+	parentCtx := ctx
+	if headers != nil {
+		parentCtx = m.propagator.Extract(parentCtx, propagation.HeaderCarrier(headers))
+	}
 	mutableMeta := param.GetMeta()
 	if mutableMeta == nil {
 		mutableMeta = make(map[string]any)
@@ -101,17 +124,39 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	mc := metaMapCarrier{
 		m: mutableMeta,
 	}
-	parentCtx := m.propagator.Extract(ctx, mc)
+	if hasTraceKey(mutableMeta) {
+		parentCtx = m.propagator.Extract(parentCtx, mc)
+	}
+
+	// Copy well-known baggage keys onto span attributes. The baggage
+	// itself still propagates via [propagator.Inject] below -- this just
+	// surfaces correlation identifiers (ticket/user/role) on the span so
+	// operators can find all traces for a ticket or user without joining
+	// against the baggage header.
+	if bag := baggage.FromContext(parentCtx); bag.Len() > 0 {
+		for key, attrKey := range baggageSpanAttributes {
+			if m := bag.Member(key); m.Key() != "" {
+				attrs = append(attrs, attribute.String(attrKey, m.Value()))
+			}
+		}
+	}
 
 	// Start the span with options appropriate for the semantic convention.
 	// Convert method name to span name following mcp-go SDK patterns
 	spanName := getSpanName(req.Method)
 	newCtx, span := m.tracer.Start(parentCtx, spanName, trace.WithSpanKind(trace.SpanKindClient))
 
-	// Always inject trace context into the header mutation if provided.
-	// This ensures trace propagation works even for unsampled spans.
+	// Always inject trace context into the MCP `_meta` mutation so the
+	// MCP-protocol carrier is populated. This ensures trace propagation
+	// works for downstream MCP hops and even for unsampled spans.
 	m.propagator.Inject(newCtx, mc)
 	param.SetMeta(mc.m)
+	// Also inject into the inbound HTTP headers so any downstream HTTP
+	// hop driven off `headers` (e.g. the upstream MCP request built from
+	// the same header set) sees the updated trace context and baggage.
+	if headers != nil {
+		m.propagator.Inject(newCtx, propagation.HeaderCarrier(headers))
+	}
 
 	// Only record request attributes if span is recording (sampled).
 	if span.IsRecording() {
@@ -120,6 +165,23 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	}
 
 	return nil
+}
+
+// hasTraceKey reports whether the MCP `_meta` map contains a W3C Trace
+// Context key, so we only apply meta-based extraction when meta actually
+// carries a trace context. Extracting from an empty carrier is harmless
+// but extracting from a carrier that only contains unrelated keys can
+// overwrite a valid span context populated from HTTP headers.
+func hasTraceKey(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	for _, k := range []string{"traceparent", "tracestate", "baggage"} {
+		if _, ok := meta[k]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func getMCPParamsAsAttributes(p mcp.Params) []attribute.KeyValue {

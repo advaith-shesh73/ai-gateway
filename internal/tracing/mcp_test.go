@@ -102,6 +102,83 @@ func TestTracer_StartSpanAndInjectMeta_MetaAndHeaderFallback(t *testing.T) {
 	}
 }
 
+// TestTracer_StartSpanAndInjectMeta_W3CHeaderContext verifies that a W3C
+// traceparent header on the inbound HTTP request seeds the parent span
+// context. This is the baseline client contract: clients set traceparent
+// over HTTP, the gateway span chains under it.
+func TestTracer_StartSpanAndInjectMeta_W3CHeaderContext(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	const (
+		traceID = "0af7651916cd43dd8448eb211c80319c"
+		spanID  = "b7ad6b7169203331"
+	)
+	headers := http.Header{}
+	headers.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/call"}
+	p := &mcp.CallToolParams{Name: "fake-tool"}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	// Span must chain under the traceparent the client sent, not a fresh trace.
+	require.Equal(t, traceID, spans[0].SpanContext.TraceID().String())
+	require.Equal(t, spanID, spans[0].Parent.SpanID().String())
+
+	// Gateway-mutated meta must also carry the (new) trace context so the
+	// MCP-protocol carrier is usable by downstream MCP hops.
+	meta := p.GetMeta()
+	require.NotNil(t, meta)
+	require.NotEmpty(t, meta["traceparent"])
+}
+
+// TestTracer_StartSpanAndInjectMeta_Baggage verifies that well-known W3C
+// baggage keys set by clients over HTTP are (a) promoted to span attributes
+// under the `mcp.client.*` namespace and (b) re-injected into both the
+// MCP _meta map and the HTTP headers on the way out so they reach upstream
+// services.
+func TestTracer_StartSpanAndInjectMeta_Baggage(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	headers.Set("baggage", "ticket=TICK-42,user=alice%40example.com,role=oncall,opaque=keep-me")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("mcp.client.ticket", "TICK-42"))
+	require.Contains(t, attrs, attribute.String("mcp.client.user", "alice@example.com"))
+	require.Contains(t, attrs, attribute.String("mcp.client.role", "oncall"))
+	// Opaque keys should NOT leak onto span attributes.
+	for _, a := range attrs {
+		require.NotEqual(t, attribute.Key("mcp.client.opaque"), a.Key)
+	}
+
+	// Baggage is propagated back onto headers so the downstream MCP hop
+	// carries it. The header must still include the opaque key.
+	outHeader := headers.Get("baggage")
+	require.Contains(t, outHeader, "ticket=TICK-42")
+	require.Contains(t, outHeader, "role=oncall")
+	require.Contains(t, outHeader, "opaque=keep-me")
+}
+
 func Test_getMCPAttributes(t *testing.T) {
 	cases := []struct {
 		p        mcp.Params
