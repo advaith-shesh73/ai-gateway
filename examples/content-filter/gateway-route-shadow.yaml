@@ -49,10 +49,10 @@ spec:
       path: "/mcp"
       # ContentFilter: the PR-95-ported eval policy running in shadow
       # mode. For each `tools/call` RESPONSE the gateway POSTs the
-      # envelope to http://content-filter.content-filter:80/filter; the
-      # verdict is recorded but NEVER applied to the traffic.
+      # envelope to http://content-filter.content-filter:80/v1/filter;
+      # the verdict is recorded but NEVER applied to the traffic.
       contentFilter:
-        url: http://content-filter.content-filter.svc.cluster.local:80/filter
+        url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
         scopes:
           - Response
         # Failure mode is pass-through during shadow rollout: a
@@ -77,8 +77,17 @@ spec:
         # filter entirely WITHOUT editing the route (useful for
         # operators who only hold per-namespace permission). For a
         # cluster-wide kill switch, set `globalDisable: true` on the
-        # MCPContentFilterPolicy ConfigMap instead.
+        # MCPContentFilterPolicyConfig ConfigMap instead.
         enabled: true
+        # Policies the filter service must apply. Shadow rollout for
+        # evaluation workloads typically exercises BOTH engines (PII
+        # anonymizer + LLM evalpolicy) so shadow metrics tell us what
+        # each policy would have redacted. Dropping "evalpolicy" here
+        # would measure only PII cost; dropping "pii" would measure
+        # only the LLM evalpolicy's redaction rate.
+        policies:
+          - pii
+          - evalpolicy
         # Forward the Authorization and X-Eval-Ticket-Id headers so
         # the filter can (a) call the LLM with the caller's bearer
         # token (if relevant) and (b) pick up a per-call ticket

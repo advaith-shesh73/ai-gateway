@@ -96,7 +96,7 @@ func TestContentFilter_IsDisabled_GlobalDisableTrumpsEverything(t *testing.T) {
 	enabled := true
 	cf := &contentFilter{
 		enabled: &enabled, // per-backend says on
-		policy:  &filterapi.MCPContentFilterPolicy{GlobalDisable: true},
+		policy:  &filterapi.MCPContentFilterPolicyConfig{GlobalDisable: true},
 	}
 	require.True(t, cf.isDisabled(),
 		"GlobalDisable must short-circuit even when the per-backend Enabled flag is true")
@@ -221,7 +221,7 @@ func TestApplyOnRequest_KillSwitchGlobalDisable_SkipsUpstream(t *testing.T) {
 	defer srv.Close()
 
 	cf := newTestFilter(t, srv.URL, false)
-	cf.policy = &filterapi.MCPContentFilterPolicy{GlobalDisable: true}
+	cf.policy = &filterapi.MCPContentFilterPolicyConfig{GlobalDisable: true}
 
 	req := &jsonrpc.Request{ID: makeID(t, float64(1)), Method: "tools/call"}
 	got, status, err := applyContentFilterOnRequestWithStatus(context.Background(),
@@ -476,7 +476,10 @@ func TestApplyOnResponse_EnforceMode_IgnoresSamplingRate(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		atomic.AddInt32(&hits, 1)
-		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:      contentFilterActionPass,
+			RanPolicies: []string{"test-policy"},
+		})
 	}))
 	defer srv.Close()
 
