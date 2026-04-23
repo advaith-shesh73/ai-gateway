@@ -18,6 +18,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -127,6 +129,71 @@ func TestCompileContentFilter_CustomTimeoutAndFailPolicy(t *testing.T) {
 	require.True(t, cf.failClosed)
 }
 
+// --- Policies compile ------------------------------------------------------
+
+// TestCompileContentFilter_PoliciesEmptyYieldsNil asserts that neither
+// a missing nor an empty Policies slice allocates anything — the
+// envelope path substitutes []string{} at send time, but the compiled
+// filter stores nil. This keeps the "no policies attached" snapshot
+// cheap and lets the envelope code stay the single place that decides
+// the wire shape.
+func TestCompileContentFilter_PoliciesEmptyYieldsNil(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+			URL:    "http://x",
+			Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		}, "r", "b")
+		require.NoError(t, err)
+		require.Nil(t, cf.policies)
+	})
+	t.Run("empty_slice", func(t *testing.T) {
+		cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+			URL:      "http://x",
+			Scopes:   []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+			Policies: []filterapi.MCPContentFilterPolicy{},
+		}, "r", "b")
+		require.NoError(t, err)
+		require.Nil(t, cf.policies)
+	})
+}
+
+// TestCompileContentFilter_PoliciesPreservedAndDeduped asserts the
+// compile step preserves author-declared order while dropping duplicate
+// and whitespace-only entries. Order matters because the filter service
+// merges verdicts with a well-defined precedence; reordering would
+// change observability output (trace attribute order, audit log).
+func TestCompileContentFilter_PoliciesPreservedAndDeduped(t *testing.T) {
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:    "http://x",
+		Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{
+			filterapi.MCPContentFilterPolicyPII,
+			filterapi.MCPContentFilterPolicyEvalPolicy,
+			filterapi.MCPContentFilterPolicyPII, // duplicate
+			"",                                  // empty, skipped
+			"   ",                               // whitespace-only, skipped
+			"secrets",                           // forward-compat unknown value accepted verbatim
+		},
+	}, "r", "b")
+	require.NoError(t, err)
+	require.Equal(t, []string{"pii", "evalpolicy", "secrets"}, cf.policies)
+}
+
+// TestCompileContentFilter_PoliciesAcceptsUnknown asserts the gateway
+// does NOT reject unknown policy names at compile time. The CRD's
+// Enum validator catches typos at admission, and forward-compat is
+// expensive to lose: an operator should be able to enable a new policy
+// by editing CRD + filter service without rebuilding the gateway.
+func TestCompileContentFilter_PoliciesAcceptsUnknown(t *testing.T) {
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:      "http://x",
+		Scopes:   []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{"future-policy"},
+	}, "r", "b")
+	require.NoError(t, err)
+	require.Equal(t, []string{"future-policy"}, cf.policies)
+}
+
 // --- selectHeaders ---------------------------------------------------------
 
 func TestSelectHeaders_NilSourceReturnsEmpty(t *testing.T) {
@@ -179,6 +246,66 @@ func newTestFilter(t *testing.T, serverURL string, failClosed bool) *contentFilt
 	return cf
 }
 
+// TestInvoke_PropagatesW3CTraceAndBaggageHeaders asserts the gateway
+// injects the ambient W3C trace context and baggage into the outbound
+// filter HTTP request. This is what lets filter-side spans chain under
+// the gateway span and what carries ticket/user/role correlation keys
+// down to pii-service and the evalpolicy brain.
+func TestInvoke_PropagatesW3CTraceAndBaggageHeaders(t *testing.T) {
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{},
+	))
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+
+	var got http.Header
+	var gotEnv contentFilterRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotEnv))
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:      contentFilterActionPass,
+			RanPolicies: []string{"test-policy"},
+		})
+	}))
+	defer srv.Close()
+
+	// Seed a caller context with an inbound traceparent + baggage as the
+	// configured propagator would after StartSpanAndInjectMeta ran on an
+	// inbound gateway request.
+	inbound := http.Header{}
+	inbound.Set("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+	inbound.Set("baggage", "ticket=TICK-42,role=oncall")
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(inbound))
+
+	cf := newTestFilter(t, srv.URL, false)
+	_, _, _, _, err := cf.invoke(ctx, &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+
+	require.NotEmpty(t, got.Get("traceparent"),
+		"outbound filter request must carry W3C traceparent")
+	require.Contains(t, got.Get("baggage"), "ticket=TICK-42",
+		"outbound filter request must carry baggage for downstream correlation")
+	require.Contains(t, got.Get("baggage"), "role=oncall")
+
+	// The envelope Headers field must ALSO carry the propagation headers
+	// so filters that only inspect the JSON body (most reverse-proxied
+	// deployments) can still extract parent context + baggage. Trace
+	// context propagation is unconditional -- it must reach the filter
+	// regardless of operator-configured ForwardHeaders, because it is
+	// correlation infrastructure, not tenant data.
+	require.NotEmpty(t, gotEnv.Headers["traceparent"],
+		"envelope headers must carry W3C traceparent for filter-side span chaining")
+	require.Equal(t,
+		"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		gotEnv.Headers["traceparent"][0])
+	require.NotEmpty(t, gotEnv.Headers["baggage"],
+		"envelope headers must carry baggage for downstream correlation")
+	require.Contains(t, gotEnv.Headers["baggage"][0], "ticket=TICK-42")
+	require.Contains(t, gotEnv.Headers["baggage"][0], "role=oncall")
+}
+
 func TestInvoke_PassReturnsOriginalBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
@@ -187,12 +314,81 @@ func TestInvoke_PassReturnsOriginalBody(t *testing.T) {
 	cf := newTestFilter(t, srv.URL, false)
 	client := &http.Client{}
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`)
-	newBody, rejected, reason, err := cf.invoke(context.Background(), client,
+	newBody, rejected, reason, _, err := cf.invoke(context.Background(), client,
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, body)
 	require.NoError(t, err)
 	require.False(t, rejected)
 	require.Empty(t, reason)
 	require.Equal(t, body, newBody)
+}
+
+// TestInvoke_PoliciesForwardedInEnvelope asserts the compiled policy
+// list is serialized on the filter-request wire in the order the
+// operator declared and is always an array (never null / missing) so
+// filter implementations can rely on a stable schema.
+func TestInvoke_PoliciesForwardedInEnvelope(t *testing.T) {
+	var got contentFilterRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+	cf, err := compileContentFilter(&filterapi.MCPContentFilter{
+		URL:    srv.URL,
+		Scopes: []filterapi.MCPContentFilterScope{filterapi.MCPContentFilterScopeRequest},
+		Policies: []filterapi.MCPContentFilterPolicy{
+			filterapi.MCPContentFilterPolicyPII,
+			filterapi.MCPContentFilterPolicyEvalPolicy,
+		},
+	}, "r", "b")
+	require.NoError(t, err)
+	_, _, _, _, err = cf.invoke(context.Background(), &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"pii", "evalpolicy"}, got.Policies)
+}
+
+// TestInvoke_PoliciesEmptyEnvelopeIsArray asserts an unset Policies
+// field still produces an empty JSON array on the wire. Filters that
+// iterate policies to decide which engines to run must never observe
+// JSON null — that would force every filter to special-case nullability.
+func TestInvoke_PoliciesEmptyEnvelopeIsArray(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"policies":[]`,
+		"empty Policies must serialize as [] to keep a stable wire shape")
+}
+
+// TestInvoke_VersionPinnedInEnvelope asserts the wire-protocol version
+// is serialized unconditionally at the current const value. Filter
+// services use this field to fast-reject unsupported envelope shapes,
+// so it must be present on every request -- not behind a conditional
+// and not governed by omitempty.
+func TestInvoke_VersionPinnedInEnvelope(t *testing.T) {
+	var got contentFilterRequest
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		require.NoError(t, json.Unmarshal(raw, &got))
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+	}))
+	defer srv.Close()
+	cf := newTestFilter(t, srv.URL, false)
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
+		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
+	require.NoError(t, err)
+	require.Equal(t, contentFilterRequestVersion, got.Version,
+		"envelope must serialize the current wire-protocol version")
+	require.Contains(t, string(raw), `"version":1`,
+		"version field must be present on the wire (not omitempty'd away)")
 }
 
 func TestInvoke_RedactReturnsNewBody(t *testing.T) {
@@ -208,7 +404,7 @@ func TestInvoke_RedactReturnsNewBody(t *testing.T) {
 	cf := newTestFilter(t, srv.URL, false)
 	client := &http.Client{}
 	original := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"email":"a@b.com"}}`)
-	newBody, rejected, reason, err := cf.invoke(context.Background(), client,
+	newBody, rejected, reason, _, err := cf.invoke(context.Background(), client,
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, original)
 	require.NoError(t, err)
 	require.False(t, rejected)
@@ -222,7 +418,7 @@ func TestInvoke_RedactMissingBodyIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, true)
-	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing bodyBase64")
@@ -237,7 +433,7 @@ func TestInvoke_RejectReturnsRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, false)
-	_, rejected, reason, err := cf.invoke(context.Background(), &http.Client{},
+	_, rejected, reason, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.NoError(t, err)
 	require.True(t, rejected)
@@ -250,7 +446,7 @@ func TestInvoke_UnknownActionIsError(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, false)
-	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown action")
@@ -262,7 +458,7 @@ func TestInvoke_NonSuccessStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, false)
-	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "HTTP 400")
@@ -274,7 +470,7 @@ func TestInvoke_MalformedResponseJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, false)
-	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "decode content filter response")
@@ -289,7 +485,7 @@ func TestInvoke_ResponseOverSizeLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 	cf := newTestFilter(t, srv.URL, false)
-	_, _, _, err := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, err := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeds")
@@ -315,7 +511,7 @@ func TestInvoke_Timeout(t *testing.T) {
 	}, "r", "b")
 	require.NoError(t, err)
 	start := time.Now()
-	_, _, _, invokeErr := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, invokeErr := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	elapsed := time.Since(start)
 	require.Error(t, invokeErr)
@@ -342,7 +538,7 @@ func TestInvoke_SendsConfiguredHeadersOnly(t *testing.T) {
 	hdr.Set("X-User-Id", "u1")
 	hdr.Set("Authorization", "Bearer s3cr3t")
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`)
-	_, _, _, invokeErr := cf.invoke(context.Background(), &http.Client{},
+	_, _, _, _, invokeErr := cf.invoke(context.Background(), &http.Client{},
 		contentFilterScopeRequest, "my-route", "my-backend", "tools/call", "lookup", hdr, body)
 	require.NoError(t, invokeErr)
 

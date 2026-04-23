@@ -8,7 +8,7 @@ package mcpproxy
 // Tests for the redaction audit-log primitive kept on the gateway
 // side. PII-client integration tests (fail-open vs fail-closed
 // emissions) live with the external filter service now — see
-// panacea-agent/services/aigw-content-filter-dispatcher.
+// panacea-agent/services/aigw-content-filter.
 //
 // Scope of coverage here is limited to:
 //   * SlogRedactionAuditLogger emits JSON with the expected fields

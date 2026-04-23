@@ -735,12 +735,24 @@ func translateContentFilter(cf *aigv1a1.MCPContentFilterConfig) *filterapi.MCPCo
 	for _, s := range cf.Scopes {
 		scopes = append(scopes, filterapi.MCPContentFilterScope(s))
 	}
+	// Policies are forwarded verbatim; the runtime mirror preserves
+	// the same ordering and set semantics so the gateway can emit
+	// them in the filter envelope without re-validating. An empty
+	// input list is mapped to a nil slice (omitempty in JSON).
+	var policies []filterapi.MCPContentFilterPolicy
+	if len(cf.Policies) > 0 {
+		policies = make([]filterapi.MCPContentFilterPolicy, 0, len(cf.Policies))
+		for _, p := range cf.Policies {
+			policies = append(policies, filterapi.MCPContentFilterPolicy(p))
+		}
+	}
 	out := &filterapi.MCPContentFilter{
 		URL:                      cf.URL,
 		Scopes:                   scopes,
 		TimeoutSeconds:           ptr.Deref(cf.TimeoutSeconds, 0),
 		ForwardHeaders:           append([]string(nil), cf.ForwardHeaders...),
 		ShadowSampleRatePermille: ptr.Deref(cf.ShadowSampleRatePermille, 0),
+		Policies:                 policies,
 	}
 	if cf.FailurePolicy != nil {
 		out.FailurePolicy = filterapi.MCPContentFilterFailurePolicy(*cf.FailurePolicy)

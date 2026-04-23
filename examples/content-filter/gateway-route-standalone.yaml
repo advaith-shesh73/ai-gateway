@@ -56,13 +56,20 @@ spec:
       kind: MCPRoute
       name: jira-evaluation-route
       sectionName: jira-mcp
-  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
   scopes:
     - Response
   failurePolicy: Fail
   timeoutSeconds: 65
   mode: Enforce
   enabled: true
+  # Jira responses carry both customer-reported PII AND evaluation
+  # ticket content we want an LLM to scrub semantically. Run both
+  # engines; dropping one entry disables exactly that engine for
+  # this backend without touching the filter service deployment.
+  policies:
+    - pii
+    - evalpolicy
   forwardHeaders:
     - "X-Eval-Ticket-Id"
     - "X-Request-Id"
@@ -89,7 +96,7 @@ spec:
     - group: aigateway.envoyproxy.io
       kind: MCPRoute
       name: fleet-shadow-route
-  url: http://content-filter.content-filter.svc.cluster.local:80/filter
+  url: http://content-filter.content-filter.svc.cluster.local:80/v1/filter
   scopes:
     - Response
   failurePolicy: PassThrough
@@ -97,6 +104,11 @@ spec:
   mode: Shadow
   shadowSampleRatePermille: 100
   enabled: true
+  # Fleet-wide shadow rollout: measure PII-only redaction cost across
+  # every backend on the route. Add "evalpolicy" here once the LLM
+  # cost envelope for the fleet is understood.
+  policies:
+    - pii
   forwardHeaders:
     - "X-Request-Id"
 
