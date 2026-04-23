@@ -259,9 +259,14 @@ func TestInvoke_PropagatesW3CTraceAndBaggageHeaders(t *testing.T) {
 	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
 
 	var got http.Header
+	var gotEnv contentFilterRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Clone()
-		_ = json.NewEncoder(w).Encode(contentFilterResponse{Action: contentFilterActionPass})
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotEnv))
+		_ = json.NewEncoder(w).Encode(contentFilterResponse{
+			Action:      contentFilterActionPass,
+			RanPolicies: []string{"test-policy"},
+		})
 	}))
 	defer srv.Close()
 
@@ -274,7 +279,7 @@ func TestInvoke_PropagatesW3CTraceAndBaggageHeaders(t *testing.T) {
 	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(inbound))
 
 	cf := newTestFilter(t, srv.URL, false)
-	_, _, _, err := cf.invoke(ctx, &http.Client{},
+	_, _, _, _, err := cf.invoke(ctx, &http.Client{},
 		contentFilterScopeRequest, "r", "b", "tools/call", "", http.Header{}, []byte(`{}`))
 	require.NoError(t, err)
 
@@ -283,6 +288,22 @@ func TestInvoke_PropagatesW3CTraceAndBaggageHeaders(t *testing.T) {
 	require.Contains(t, got.Get("baggage"), "ticket=TICK-42",
 		"outbound filter request must carry baggage for downstream correlation")
 	require.Contains(t, got.Get("baggage"), "role=oncall")
+
+	// The envelope Headers field must ALSO carry the propagation headers
+	// so filters that only inspect the JSON body (most reverse-proxied
+	// deployments) can still extract parent context + baggage. Trace
+	// context propagation is unconditional -- it must reach the filter
+	// regardless of operator-configured ForwardHeaders, because it is
+	// correlation infrastructure, not tenant data.
+	require.NotEmpty(t, gotEnv.Headers["traceparent"],
+		"envelope headers must carry W3C traceparent for filter-side span chaining")
+	require.Equal(t,
+		"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		gotEnv.Headers["traceparent"][0])
+	require.NotEmpty(t, gotEnv.Headers["baggage"],
+		"envelope headers must carry baggage for downstream correlation")
+	require.Contains(t, gotEnv.Headers["baggage"][0], "ticket=TICK-42")
+	require.Contains(t, gotEnv.Headers["baggage"][0], "role=oncall")
 }
 
 func TestInvoke_PassReturnsOriginalBody(t *testing.T) {

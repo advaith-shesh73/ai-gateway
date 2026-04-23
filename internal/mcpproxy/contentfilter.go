@@ -441,6 +441,33 @@ func (cf *contentFilter) invoke(
 	if policies == nil {
 		policies = []string{}
 	}
+
+	callCtx, cancel := context.WithTimeout(ctx, cf.timeout)
+	defer cancel()
+
+	envHeaders := cf.selectHeaders(headers)
+	if envHeaders == nil {
+		envHeaders = map[string][]string{}
+	}
+	// Propagate W3C trace context and baggage to the filter service via
+	// the envelope Headers field in addition to the outgoing HTTP request
+	// headers. The filter's envelope-based
+	// extract_context_from_headers relies on this to chain filter-side
+	// spans under the gateway span and to forward correlation identifiers
+	// (ticket/user/role) to pii-service and the evalpolicy brain.
+	//
+	// Trace-context propagation is unconditional: these are W3C-standard
+	// correlation headers, not tenant data, and must NOT depend on
+	// operator CRD ForwardHeaders config. Skipping them here regresses
+	// observability for filters that only look at the envelope (i.e.
+	// everything that doesn't see the HTTP Header map on the request
+	// object -- which is the case through most reverse-proxy setups).
+	envCarrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(callCtx, envCarrier)
+	for k, v := range envCarrier {
+		envHeaders[k] = []string{v}
+	}
+
 	env := contentFilterRequest{
 		Version:     contentFilterRequestVersion,
 		Route:       route,
@@ -449,7 +476,7 @@ func (cf *contentFilter) invoke(
 		MCPMethod:   mcpMethod,
 		Tool:        tool,
 		Policies:    policies,
-		Headers:     cf.selectHeaders(headers),
+		Headers:     envHeaders,
 		BodyBase64:  base64.StdEncoding.EncodeToString(body),
 		ContentType: "application/json",
 	}
@@ -458,9 +485,6 @@ func (cf *contentFilter) invoke(
 		return nil, false, "", nil, fmt.Errorf("marshal content filter request: %w", mErr)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, cf.timeout)
-	defer cancel()
-
 	req, reqErr := http.NewRequestWithContext(callCtx, http.MethodPost, cf.url, bytes.NewReader(envBytes))
 	if reqErr != nil {
 		return nil, false, "", nil, fmt.Errorf("build content filter request: %w", reqErr)
@@ -468,10 +492,10 @@ func (cf *contentFilter) invoke(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	// Propagate W3C trace context and baggage to the filter service so
-	// filter-side spans chain under the gateway span and correlation
-	// identifiers (ticket/user/role) reach pii-service and the evalpolicy
-	// brain. The propagator is the process-wide one configured by
+	// Also inject trace context onto the outbound HTTP headers so L7
+	// infrastructure (Envoy, meshes, logs) that does not speak the
+	// filter envelope still correlates with the gateway span. The
+	// propagator is the process-wide one configured by
 	// [tracing.NewTracingFromEnv]; when tracing is disabled this is a
 	// no-op propagator and no headers are written.
 	otel.GetTextMapPropagator().Inject(callCtx, propagation.HeaderCarrier(req.Header))
