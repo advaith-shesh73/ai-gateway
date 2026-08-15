@@ -8,10 +8,13 @@ applies the verdict (`pass`, `redact`, `reject`).
 
 ## Where the filter service lives
 
-The reference implementation of the filter service (PR 95 evaluation
-policy — LLM-powered semantic redaction) is maintained in
-[panacea-agent](https://github.com/nutanix-core/panacea-agent)
-under `services/aigw-content-filter-dispatcher/`. Deploy that
+The reference implementation of the filter service is maintained in
+[panacea-agent](https://github.com/nutanix-core/panacea-agent) under
+`services/aigw-content-filter/`. It is a stateless policy dispatcher:
+for each request it reads the `policies` list from the envelope and
+fans out to the engines it is configured with (a PII anonymizer for
+`"pii"`, an LLM-backed evalpolicy binary for `"evalpolicy"`, etc.),
+merging the verdicts (`reject` > `redact` > `pass`). Deploy that
 service independently (Helm chart in the same repo) and point these
 gateway manifests at its `Service` address.
 
@@ -19,8 +22,19 @@ From the gateway's point of view the filter is just another HTTP
 backend speaking a tiny JSON envelope:
 
 - `POST /v1/filter`
-- Request body: `{"scope":"request|response","tool":"...","bodyBase64":"..."}`
+- Request body:
+  `{"scope":"Request|Response","tool":"...","policies":["pii","evalpolicy"],"bodyBase64":"..."}`
 - Response body: `{"action":"pass|redact|reject","bodyBase64":"...","reason":"..."}`
+
+The `policies` field is the contract that makes the gateway
+backend-agnostic: the gateway never decides _which_ engines to run —
+it forwards the list verbatim. The filter service is the single
+dispatcher that maps policy names to engines and merges their
+verdicts. Operators toggle engines per route/backend by editing the
+`policies` list on the `MCPContentFilter`, not by flipping env flags
+on the filter service. An empty or missing list means "run no
+engines" (pass-through), which is useful in shadow mode for measuring
+envelope cost without invoking any LLM.
 
 Any service implementing that contract is acceptable — the evaluation
 policy in panacea-agent is one reference implementation, not the only
@@ -66,7 +80,7 @@ applies to every backend on the route.
 | `gateway-route-shadow.yaml`     | **Inline form.** `MCPRoute` wiring the filter into a Jira backend in **shadow mode** with 10% sampling.                                                          |
 | `gateway-route-enforce.yaml`    | **Inline form.** Same `MCPRoute` flipped to **enforce mode** with `failurePolicy: Fail`.                                                                         |
 | `gateway-route-standalone.yaml` | **Standalone form.** Two top-level `MCPContentFilter` objects — one scoped to a single backend via `sectionName`, one attached route-wide with no `sectionName`. |
-| `global-kill-switch.yaml`       | Example `MCPContentFilterPolicy` ConfigMap for the cluster-wide `globalDisable` knob.                                                                            |
+| `global-kill-switch.yaml`       | Example `MCPContentFilterPolicyConfig` ConfigMap for the cluster-wide `globalDisable` knob.                                                                      |
 
 ## Rollout recipe
 
@@ -83,7 +97,7 @@ The three knobs that matter during rollout are:
 ### Step 1 — Deploy the filter service
 
 See the [panacea-agent
-documentation](https://github.com/nutanix-core/panacea-agent/tree/main/services/aigw-content-filter-dispatcher)
+documentation](https://github.com/nutanix-core/panacea-agent/tree/main/services/aigw-content-filter)
 for how to deploy the external filter service. Make a note of the
 Kubernetes `Service` DNS name (e.g.
 `aigw-content-filter.panacea.svc.cluster.local:8080`) — you'll
@@ -162,10 +176,18 @@ one backend.)
 
 ## Tuning the filter's behaviour
 
-All filter-side knobs (LLM endpoint, model, filtered tool allowlist,
-timeout, ticket-header name, etc.) now live with the external
-service — see `services/aigw-content-filter-dispatcher/` in
-panacea-agent. The gateway only controls **when** the filter is
-invoked (shadow vs enforce, sample rate, kill switches) and **how**
-it reacts to verdicts — it does not understand the filter's
-internals.
+All filter-side engine knobs (LLM endpoint, model, PII service URL,
+LLM timeout, ticket-header name, etc.) live with the external
+service — see `services/aigw-content-filter/` in panacea-agent. The
+gateway controls:
+
+- **Which policies run** per route/backend (`policies: [pii,
+  evalpolicy]`). This is the new single source of truth for engine
+  selection; the filter service is a stateless dispatcher and does
+  NOT consult backend names or environment flags to pick engines.
+- **When** the filter is invoked (`scopes`, `mode: Shadow|Enforce`,
+  `shadowSampleRatePermille`).
+- **How** it reacts to verdicts (`failurePolicy`, per-backend
+  `enabled`, cluster-wide `globalDisable`).
+
+It does not understand each engine's internals.

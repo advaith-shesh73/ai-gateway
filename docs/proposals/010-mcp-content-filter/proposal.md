@@ -7,9 +7,9 @@
 > Policy Service_ and _Dispatcher Architecture_ sections) have since
 > been **moved out of ai-gateway** and now live in
 > [panacea-agent](https://github.com/nutanix-core/panacea-agent)
-> under `services/aigw-content-filter-dispatcher/` (dispatcher +
-> eval policy) and `services/aigw-content-filter/go/` (evalpolicy
-> HTTP service). The gateway retains only the HTTP client path, the
+> under `services/aigw-content-filter/` (Python policy dispatcher)
+> and `services/aigw-content-filter/go/` (evalpolicy HTTP brain).
+> The gateway retains only the HTTP client path, the
 > `MCPContentFilter` API surface on `MCPRoute`, the shadow/enforce
 > knobs, and the `GlobalDisable` kill switch. Refer to the
 > panacea-agent repo for the current filter service layout.

@@ -86,7 +86,7 @@ type MCPContentFilter struct {
 	// carry the field). Setting the pointer to false short-circuits
 	// every Request/Response-scope invocation for this backend and
 	// reports X-Content-Filter-Status: disabled. Global overrides
-	// live on MCPContentFilterPolicy.GlobalDisable.
+	// live on MCPContentFilterPolicyConfig.GlobalDisable.
 	Enabled *bool `json:"enabled,omitempty"`
 
 	// ShadowSampleRatePermille bounds shadow-mode invocations in
@@ -96,6 +96,15 @@ type MCPContentFilter struct {
 	// Values outside the range are clamped at validation time.
 	// Ignored when Mode is not Shadow.
 	ShadowSampleRatePermille int32 `json:"shadowSampleRatePermille,omitempty"`
+
+	// Policies is the list of policy kinds the filter service should
+	// apply. The gateway forwards this list verbatim in the filter
+	// envelope's "policies" field; the filter service dispatches to
+	// its engines (PII, evalpolicy, ...) and merges verdicts. An
+	// empty list means the filter is invoked but no policies run
+	// (useful under Mode=Shadow for envelope-only observation).
+	// Mirror of [aigv1a1.MCPContentFilterConfig.Policies].
+	Policies []MCPContentFilterPolicy `json:"policies,omitempty"`
 }
 
 // MCPContentFilterScope is the runtime mirror of
@@ -134,6 +143,19 @@ const (
 	// forwards the ORIGINAL body. See [aigv1a1.MCPContentFilterMode]
 	// for the full contract.
 	MCPContentFilterModeShadow MCPContentFilterMode = "Shadow"
+)
+
+// MCPContentFilterPolicy is the runtime mirror of
+// [aigv1a1.MCPContentFilterPolicy]. See that type for the contract
+// and the list of recognised policy names.
+type MCPContentFilterPolicy string
+
+const (
+	// MCPContentFilterPolicyPII selects PII / sensitive-data anonymization.
+	MCPContentFilterPolicyPII MCPContentFilterPolicy = "pii"
+	// MCPContentFilterPolicyEvalPolicy selects the LLM-backed
+	// evaluation-mode anti-leakage policy.
+	MCPContentFilterPolicyEvalPolicy MCPContentFilterPolicy = "evalpolicy"
 )
 
 // MCPBackendName is the name of the MCP backend.

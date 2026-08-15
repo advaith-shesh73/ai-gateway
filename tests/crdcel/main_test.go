@@ -292,6 +292,10 @@ func TestMCPRoutes(t *testing.T) {
 			name:   "content_filter_timeout_too_large.yaml",
 			expErr: "spec.backendRefs[0].contentFilter.timeoutSeconds",
 		},
+		{
+			name:   "content_filter_invalid_policy.yaml",
+			expErr: "spec.backendRefs[0].contentFilter.policies",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data, err := testdata.ReadFile(path.Join("testdata/mcpgatewayroutes", tc.name))

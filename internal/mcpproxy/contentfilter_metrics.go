@@ -20,7 +20,7 @@ import (
 // These are the only metrics the gateway emits about the content
 // filter. Everything PII-, Jira-, cache-, or breaker-related now lives
 // inside the external filter service (see
-// panacea-agent/services/aigw-content-filter-dispatcher).
+// panacea-agent/services/aigw-content-filter).
 //
 // Concurrency: all Prometheus vectors are safe for concurrent use.
 // PrometheusMetrics itself owns no mutable state beyond the vectors.
